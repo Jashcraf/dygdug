@@ -224,5 +224,6 @@ def vortex_prop(input_field, efl, fft_mask, mft_list, mft_masks, dbg=False, meth
         return at_lyot_fft, mft_fields, debug_fields
 
     total_mft_field = sum(mft_fields)
-    total_field = at_lyot_fft + total_mft_field
-    return total_field
+    # total_field = at_lyot_fft + total_mft_field
+    # return total_field
+    return at_lyot_fft,total_mft_field
