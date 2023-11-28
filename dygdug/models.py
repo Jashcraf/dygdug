@@ -7,7 +7,7 @@ from prysm import (
     polynomials,
     geometry,
 )
-from prysm.experimental.dm import DM
+from prysm.x.dm import DM
 from prysm._richdata import RichData
 from prysm.mathops import np
 
