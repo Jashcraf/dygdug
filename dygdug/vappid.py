@@ -304,6 +304,7 @@ class APLCOptimizer2:
         self.zonal = False
         self.fpm = fpm
         self.ls = ls
+        self.cost = []
 
     def set_optimization_method(self, zonal=False):
         self.zonal = zonal
@@ -364,6 +365,7 @@ class APLCOptimizer2:
         self.aplc = aplc
         self.I = I
         self.E = E
+        self.cost.append(np.mean(I[self.dh]))
 
         # the fields
         self.b = b
