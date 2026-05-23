@@ -101,6 +101,38 @@ class Pupil:
         return cls(data=data, dx=dx)
 
     @classmethod
+    def annular(cls, Dpup, Npup, inner_radius, outer_radius):
+        """Create an annular pupil aperture.
+
+        AI Disclosure: written by Claude Haiku 4.5
+
+        Parameters
+        ----------
+        Dpup : float
+            Diameter of the pupil in physical distance units
+        Npup : int
+            Number of pixels per side of the square pupil
+        inner_radius : float
+            Inner radius of annulus in physical distance units
+        outer_radius : float
+            Outer radius of annulus in physical distance units
+
+        Returns
+        -------
+        Pupil
+            Pupil with annular transmissive region
+        """
+        dx = Dpup / Npup
+        x, y = coordinates.make_xy_grid(Npup, dx=dx)
+        r = np.hypot(x, y)
+
+        inner_circle = geometry.truecircle(inner_radius, r)
+        outer_circle = geometry.truecircle(outer_radius, r)
+        data = outer_circle * (1 - inner_circle)
+
+        return cls(data=data, dx=dx)
+
+    @classmethod
     def hexagonal_segmented(
         cls,
         Dpup,
@@ -145,7 +177,7 @@ class FPM:
         r = np.hypot(x, y)
 
         def fpmfunc(wvl):
-            return 1 - geometry.truecircle(radius * lamD, r)
+            return 1 - geometry.circle(radius * lamD, r)
 
         # TODO: need to del x, y here?  They should be collected because
         # they went out of scope, but maybe keeping r around through a closure
@@ -154,6 +186,48 @@ class FPM:
         # humor
         caller_number_1 = WavelengthDependentFunctionCache(fpmfunc)
         return cls(caller_number_1, dx)
+
+    @classmethod
+    def annular(cls, N, lamD, px_per_lamD, inner_radius, outer_radius):
+        """Create an annular focal plane mask.
+
+        AI Disclosure: written by Claude Haiku 4.5
+
+        Parameters
+        ----------
+        N : int
+            Number of pixels per side of the square mask
+        lamD : float
+            Lambda/D scale (physical units)
+        px_per_lamD : float
+            Pixels per lambda/D (resolution)
+        inner_radius : float
+            Inner radius of annulus in lambda/D
+        outer_radius : float
+            Outer radius of annulus in lambda/D
+
+        Returns
+        -------
+        FPM
+            Focal plane mask with annular transmissive region
+
+        """
+        dx = lamD / px_per_lamD
+        x, y = coordinates.make_xy_grid(N, dx=dx)
+        r = np.hypot(x, y)
+
+        # Convert radii from lambda/D to physical units
+        inner_r = inner_radius * lamD
+        outer_r = outer_radius * lamD
+
+        def fpmfunc(wvl):
+            # Create mask: 1 inside the annulus, 0 outside
+            inner_circle = geometry.circle(inner_r, r)
+            outer_circle = geometry.circle(outer_r, r)
+            return outer_circle * (1 - inner_circle)
+
+        caller_number_2 = WavelengthDependentFunctionCache(fpmfunc)
+        return cls(caller_number_2, dx)
 
     @classmethod
     def unity(cls, N, lamD, px_per_lamD):
