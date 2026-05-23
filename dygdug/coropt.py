@@ -3,7 +3,8 @@
 from prysm.mathops import np
 
 INTENSITY = 1
-CMPLX_E   = 2
+CMPLX_E = 2
+
 
 class CoronagraphOptimizer:
     def __init__(self, dark_hole, coro, wvl, opt=CMPLX_E):
@@ -12,7 +13,7 @@ class CoronagraphOptimizer:
             self.dh_mask = self.dh
             self.dh_pix_target = 0
         else:
-            raise ValueError('weighted dark hole control not yet implemented')
+            raise ValueError("weighted dark hole control not yet implemented")
             # it is just a np.isfinite to find non-nans, a flag
             # to indicate weighting in the backprop, and
             # Ibar being 2*w*(dh-dh_target)
@@ -27,11 +28,11 @@ class CoronagraphOptimizer:
         E = self.coro.fwd(self.wvl)
         if self.opt == INTENSITY:
             aE = abs(E)
-            im = aE*aE
+            im = aE * aE
             dh_pix = im[self.dh_mask]
-            cost = np.sum((dh_pix - self.dh_pix_target)**2)
+            cost = np.sum((dh_pix - self.dh_pix_target) ** 2)
             Ibar = np.zeros_like(im)
-            Ibar[self.dh_mask] = 2*(dh_pix - self.dh_pix_target)
+            Ibar[self.dh_mask] = 2 * (dh_pix - self.dh_pix_target)
             # Will jac-free Eq. 51
             # Ibar = 2 * eta * delta * (Idz - IT)
             # Idz = fwd I
@@ -73,13 +74,13 @@ class CoronagraphOptimizer:
             # z = x + i y
             # xbar = Re(zbar)
             # ybar = -Re(i zbar)
-            Ebar[self.dh_mask] = 2*(dh_pix - self.dh_pix_target)
+            Ebar[self.dh_mask] = 2 * (dh_pix - self.dh_pix_target)
 
-    # def _compute_squared_differences(weight, data, model, norm):
-    #     return np.sum((model-data)**2) / norm
+        # def _compute_squared_differences(weight, data, model, norm):
+        #     return np.sum((model-data)**2) / norm
 
-    # def _compute_squared_difference_grad(weight, data, model, norm):
-    #     return 2*(model-data) / norm
+        # def _compute_squared_difference_grad(weight, data, model, norm):
+        #     return 2*(model-data) / norm
         # return cost, Ebar
         # print(Ebar.dtype)
         grad = self.coro._rev(Ebar, self.wvl)
