@@ -68,7 +68,7 @@ coro = Coronagraph(
     executor=mdft,
 )
 
-psf = coro.forward(WVL)
+psf = coro.forward(WVL, include_fpm=True)
 
 plt.figure()
 plt.imshow(np.abs(psf) ** 2, cmap="gray", norm=LogNorm())
