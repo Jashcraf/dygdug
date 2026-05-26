@@ -15,27 +15,31 @@ class VariablePupil(Pupil):
     that selects between amplitude and phase apodization:
 
     ``'amplitude'`` (default)
-        ``x`` contains real transmission values.  ``pupil.data`` stays
-        real-valued; the cost gradient is ``Re(adjoint)`` at the mask pixels.
+        ``x`` contains real transmission values.  ``pupil.data`` is stored as
+        floating-point data so continuous amplitude updates are not coerced
+        back to a binary mask.
 
     ``'phase'``
         ``x`` contains real phase values φ.  ``pupil.data`` is complex
-        (``exp(1j·φ)``), which sets ``Coronagraph.PUPIL_IS_COMPLEX = True``
-        so that ``coro.reverse`` applies the correct ``conj`` branch.  The
-        cost gradient is ``Im(adjoint)`` at the mask pixels, derived from
-        the chain rule through ``d(exp(iφ))/dφ = i·exp(iφ)``.
+        (``exp(1j·φ)``), which sets ``Coronagraph.PUPIL_IS_COMPLEX = True``.
     """
 
     def __init__(self, data, dx, mode="amplitude"):
         if mode not in ("amplitude", "phase"):
             raise ValueError(f"mode must be 'amplitude' or 'phase', got {mode!r}")
+
+        # Capture the active region before any optimization updates.  Some
+        # geometries (e.g. CompositeHexagonalAperture.amp) are boolean; keep
+        # the mask binary, but cast the stored pupil to a continuous dtype.
+        self.mask = data == 1
         if mode == "phase":
             # Cast to complex so Coronagraph.PUPIL_IS_COMPLEX is set correctly.
             data = data.astype(complex)
+        else:
+            data = data.astype(float)
+
         super().__init__(data, dx)
         self.mode = mode
-        # Capture the active region once; used by update() on every iteration.
-        self.mask = data == 1
 
     @property
     def n_params(self):
@@ -67,6 +71,8 @@ class VariablePupil(Pupil):
 
     @classmethod
     def circle(cls, Dpup, Npup, mode="amplitude"):
+        if mode not in ("amplitude", "phase"):
+            raise ValueError(f"mode must be 'amplitude' or 'phase', got {mode!r}")
         inst = super().circle(Dpup, Npup)
         if mode == "phase":
             inst.data = inst.data.astype(complex)
@@ -75,6 +81,8 @@ class VariablePupil(Pupil):
 
     @classmethod
     def annular(cls, Dpup, Npup, inner_radius, outer_radius, mode="amplitude"):
+        if mode not in ("amplitude", "phase"):
+            raise ValueError(f"mode must be 'amplitude' or 'phase', got {mode!r}")
         inst = super().annular(Dpup, Npup, inner_radius, outer_radius)
         if mode == "phase":
             inst.data = inst.data.astype(complex)
@@ -93,6 +101,8 @@ class VariablePupil(Pupil):
         exclude=(),
         mode="amplitude",
     ):
+        if mode not in ("amplitude", "phase"):
+            raise ValueError(f"mode must be 'amplitude' or 'phase', got {mode!r}")
         inst = super().hexagonal_segmented(
             Dpup,
             Npup,
@@ -261,7 +271,9 @@ class CoronagraphOptimizer:
     """
 
     def __init__(self, dark_hole, coro, wvl, cost=MeanSquaredErrorQuadratic):
-        self.dh = dark_hole
+        # Accept 0/1 mask arrays, but always index with a boolean mask.
+        # Integer masks would otherwise trigger NumPy advanced indexing.
+        self.dh = np.asarray(dark_hole).astype(bool)
         self.coro = coro
 
         # Accept a scalar or a sequence of wavelengths.
@@ -325,9 +337,9 @@ class CoronagraphOptimizer:
             I_dh = np.abs(E_focal[self.dh]) ** 2
             J += float(self.cost_fn.forward(I_dh))
 
-            # Wirtinger gradient at focal plane: dJ/dE* = (dJ/dI) · E
+            # Wirtinger gradient at focal plane: dJ/dE* = (dJ/dI) · E.
             Ebar = np.zeros_like(E_focal)
-            Ebar[self.dh] = self.cost_fn.reverse(I_dh)
+            Ebar[self.dh] = self.cost_fn.reverse(I_dh) * E_focal[self.dh]
 
             # Back-propagate gradient to pupil plane (return value is 2D;
             # relevant slices are extracted below by the per-element helpers).
@@ -361,27 +373,24 @@ class CoronagraphOptimizer:
         """Analytical gradient w.r.t. the real optimisation variables of a
         :class:`VariablePupil`, dispatched on ``elem.mode``.
 
-        *Amplitude mode* — ``x`` are real transmissions:
-            ``coro.reverse`` (real-pupil branch) stores
-            ``adjoint = dJ/d(pupil.data)* · pupil.data``.  ``Re(adjoint)``
-            is the correct descent direction and equals the true gradient
-            at initialisation (all mask pixels = 1).
+        ``coro.reverse`` stores the Wirtinger adjoint
+        ``adj = dJ/d(pupil.data)*``.  Because the optimisation variables are
+        real, the directional derivative is
+        ``dJ = 2 Re(conj(adj) · d(pupil.data))``.
 
-        *Phase mode* — ``x`` are real phases φ, ``pupil.data = exp(iφ)``:
-            ``coro.reverse`` (complex-pupil branch) stores
-            ``adjoint = adj_raw · pupil.data.conj()`` where
-            ``adj_raw = dJ/d(pupil.data)*``.  The correct gradient via the
-            chain rule through ``E = pupil.data · E_in`` is
-            ``dJ/dφ = Im(adj_raw · field_at_entrance_pupil.conj())
-                     = Im(adjoint · pupil.data)``
-            where ``field_at_entrance_pupil = pupil.data`` here.
+        *Amplitude mode* — ``x`` are real transmissions, so
+            ``d(pupil.data)/dx = 1`` and ``dJ/dx = 2 Re(adj)``.
+
+        *Phase mode* — ``x`` are real phases φ, ``pupil.data = exp(iφ)``, so
+            ``d(pupil.data)/dφ = i exp(iφ)`` and
+            ``dJ/dφ = 2 Im(adj · conj(pupil.data))``.
         """
         adj = self.coro.adjoint_at_entrance_pupil[elem.mask]
         if elem.mode == "phase":
             field = elem.data[elem.mask]
-            return np.imag(adj * field.conj())
+            return 2 * np.imag(adj * field.conj())
         else:
-            return np.real(adj)
+            return 2 * np.real(adj)
 
     def _total_cost(self, x):
         """Forward-only cost evaluation used by the finite-difference helper."""

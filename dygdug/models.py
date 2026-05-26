@@ -95,16 +95,13 @@ class Coronagraph:
             self.adjoint_at_lyot *= self.lyot_stop.data
 
         # TODO: add wavelength-dependent function cached to fpm adjoint
-        # to avoid adjointing the same function multiple times
+        # to avoid adjointing the same function multiple times. Prysm's
+        # backpropagator applies the complex conjugate of the FPM internally.
+        fpm = self.fpm(wvl) if include_fpm else np.ones_like(self.fpm(wvl))
         self.adjoint_at_entrance_pupil = propagation.to_fpm_and_back_backprop(
             self.adjoint_at_lyot,
-            self.fpm(wvl).conj() if self.FPM_IS_COMPLEX else self.fpm(wvl),
+            fpm,
             executor=self.executor,
         )
-
-        if self.PUPIL_IS_COMPLEX:
-            self.adjoint_at_entrance_pupil *= self.pupil.data.conj()
-        else:
-            self.adjoint_at_entrance_pupil *= self.pupil.data
 
         return self.adjoint_at_entrance_pupil

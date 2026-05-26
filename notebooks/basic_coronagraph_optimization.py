@@ -78,13 +78,13 @@ model = CoronagraphOptimizer(
     wvl=WVL,
 )
 
-x0 = np.random.randn(model.n_params)
+x0 = pupil.data[pupil.mask].astype(float).copy()
 lb = np.zeros(model.n_params)
 ub = np.ones(model.n_params)
 
 opt = PrysmLBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub)
 
-pbar = tqdm(range(100))
+pbar = tqdm(range(1000))
 for i in pbar:
     x, f, g = opt.step()
     pbar.set_postfix(f=f)
@@ -93,9 +93,9 @@ print(f"final f: {f}")
 
 
 # %%
-pupil.update(x0)
+pupil.update(opt.x)
 
 plt.figure()
-plt.imshow(pupil.data)
+plt.imshow(pupil.data, cmap="gray")
 plt.colorbar()
 plt.show()
