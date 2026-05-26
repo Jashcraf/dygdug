@@ -25,7 +25,7 @@ class Coronagraph:
         else:
             self.LYOT_STOP_IS_COMPLEX = False
 
-    def forward(self, wvl, include_fpm=False):
+    def forward(self, wvl, include_fpm=True):
         """
         Propagate the field forward through the coronagraph.
 

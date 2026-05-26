@@ -99,3 +99,18 @@ plt.figure()
 plt.imshow(pupil.data, cmap="gray")
 plt.colorbar()
 plt.show()
+# %%
+coro = Coronagraph(
+    pupil=pupil,
+    fpm=fpm_func,
+    lyot_stop=lyot_stop,
+    executor=mdft,
+)
+from matplotlib.colors import LogNorm
+
+ref = np.abs(coro.forward(WVL, include_fpm=False)) ** 2
+img = np.abs(coro.forward(WVL)) ** 2
+plt.figure()
+plt.imshow(img / ref.max(), cmap="gray", norm=LogNorm(vmin=1e-10, vmax=1e-5))
+plt.colorbar()
+plt.show()
