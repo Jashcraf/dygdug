@@ -82,7 +82,7 @@ x0 = np.random.randn(model.n_params)
 lb = np.zeros(model.n_params)
 ub = np.ones(model.n_params)
 
-opt = PrysmLBFGSB(model.fg, x0, lb=lb, ub=ub)
+opt = PrysmLBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub)
 
 pbar = tqdm(range(100))
 for i in pbar:
@@ -90,3 +90,12 @@ for i in pbar:
     pbar.set_postfix(f=f)
 
 print(f"final f: {f}")
+
+
+# %%
+pupil.update(x0)
+
+plt.figure()
+plt.imshow(pupil.data)
+plt.colorbar()
+plt.show()

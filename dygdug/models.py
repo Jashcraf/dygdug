@@ -96,7 +96,7 @@ class Coronagraph:
 
         # TODO: add wavelength-dependent function cached to fpm adjoint
         # to avoid adjointing the same function multiple times
-        self.adjoint_at_entrance_pupil = propagation.to_fpm_and_backprop(
+        self.adjoint_at_entrance_pupil = propagation.to_fpm_and_back_backprop(
             self.adjoint_at_lyot,
             self.fpm(wvl).conj() if self.FPM_IS_COMPLEX else self.fpm(wvl),
             executor=self.executor,
