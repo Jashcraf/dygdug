@@ -140,23 +140,28 @@ class PNorm:
 
 
 class CoreThroughput:
-    def __init__(self, target=0):
+    def __init__(self, target=0, alpha=1):
         """Core Throughput Maximization, negative sign applied to both
         forward and reverse to maximize core throughput instead of
         minimize
+
+        Must be used with a dark_hole equal to the desired core window, with
+        no FPM in place
 
         Parameters
         ----------
         target: ndarray
             Core window on-axis to evaluate the core throughput
             of a coronagraph.
-
+        alpha: float
+            weight to place on this cost function
         """
         self.target = target
+        self.alpha = alpha
 
     def forward(self, x):
         """
-        Use LSE to approximate the maximum in the core window
+        Sum in core window
 
         Parameters
         ----------
@@ -164,15 +169,13 @@ class CoreThroughput:
             Image plane intensity
         """
 
-        return -1 * np.sum(x - self.target)
+        return -1 * np.sum(x - self.target) * self.alpha
 
     def reverse(self, x):
         """
-        Use softmax to backpropagate the smooth maximum in the core window
-
         Parameters
         ----------
         x: ndarray
             Image plane intensity
         """
-        return -1 * (x - self.target)
+        return -1 * (x - self.target) * self.alpha

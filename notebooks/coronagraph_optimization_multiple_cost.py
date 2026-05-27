@@ -6,7 +6,8 @@ from prysm.propagation import focus_dft, prepare_executor, to_fpm_and_back
 from prysm.x.optym import PrysmLBFGSB
 from tqdm import tqdm
 
-from dygdug.coropt import CoronagraphOptimizer, VariablePupil
+from dygdug.coropt import CoronagraphOptimizer, JointOptimizer, VariablePupil
+from dygdug.cost_functions import CoreThroughput, MeanSquaredErrorQuadratic
 from dygdug.masks import FPM, Pupil
 from dygdug.models import Coronagraph
 
@@ -53,6 +54,9 @@ pupil = VariablePupil.hexagonal_segmented(
 # Now draw an annular focal plane mask
 fpm_func = FPM.annular(Nfoc, lamD, px_per_lamD, inner_radius, outer_radius)
 
+# Need a transparent focal plane
+unit_func = FPM.unity(Nfoc, lamD, px_per_lamD)
+
 # Draw an Annular Lyot Stop with a 95% Circumscribed diameter
 inner_radius = CIRCUMSCRIBED_DIAMETER * 0.10 / 2
 outer_radius = CIRCUMSCRIBED_DIAMETER * 0.95 / 2
@@ -72,15 +76,36 @@ coro = Coronagraph(
     executor=mdft,
 )
 
-model = CoronagraphOptimizer(
+open_coro = Coronagraph(
+    pupil=pupil,
+    fpm=unit_func,
+    lyot_stop=lyot_stop,
+    executor=mdft,
+)
+waves = [0.95 * WVL, WVL, 1.05 * WVL]
+contrast = CoronagraphOptimizer(
     dark_hole=fpm_func(WVL),
     coro=coro,
-    wvl=WVL,
+    wvl=waves,
+    cost=MeanSquaredErrorQuadratic(target=0),  # max contrast
 )
 
+# Draw a 0.7 lambda/D window
+core_window = FPM.lyot(Nfoc, lamD, px_per_lamD, 0.7)
+
+throughput = CoronagraphOptimizer(
+    dark_hole=1 - core_window(WVL),
+    coro=open_coro,
+    wvl=WVL,
+    cost=CoreThroughput(target=0, alpha=1e-20),  # max throughput
+)
+
+optlist = [contrast, throughput]
+model = JointOptimizer(optlist)
+
 x0 = pupil.data[pupil.mask].astype(float).copy()
-lb = np.zeros(model.n_params)
-ub = np.ones(model.n_params)
+lb = np.zeros(contrast.n_params)
+ub = np.ones(contrast.n_params)
 
 opt = PrysmLBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub)
 
@@ -88,8 +113,6 @@ pbar = tqdm(range(1000))
 for i in pbar:
     x, f, g = opt.step()
     pbar.set_postfix(f=f)
-
-print(f"final f: {f}")
 
 
 # %%
@@ -112,7 +135,7 @@ ref = np.abs(coro.forward(WVL, include_fpm=False)) ** 2
 img = np.abs(coro.forward(WVL)) ** 2
 plt.figure()
 plt.title("Coronagraph Image")
-plt.imshow(img / ref.max(), cmap="gray", norm=LogNorm(vmin=1e-10, vmax=1e-5))
+plt.imshow(img / ref.max(), cmap="gray", norm=LogNorm(vmin=1e-10, vmax=1e-7))
 plt.colorbar()
 plt.show()
 

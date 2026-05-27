@@ -32,6 +32,8 @@ class VariablePupil(Pupil):
         # geometries (e.g. CompositeHexagonalAperture.amp) are boolean; keep
         # the mask binary, but cast the stored pupil to a continuous dtype.
         self.mask = data == 1
+        self._mask_idx = np.flatnonzero(self.mask.ravel())
+        self._n_params = int(self._mask_idx.size)
         if mode == "phase":
             # Cast to complex so Coronagraph.PUPIL_IS_COMPLEX is set correctly.
             data = data.astype(complex)
@@ -245,6 +247,39 @@ class VariableLyotStop(Pupil):
             self.data = geometry.truecircle(x[0], self._r)
 
 
+class ThroughputOptimizer:
+    """Coronagraph optimizer that sums the values in the apodizer
+    only meaningful for Amplitude-apodized coronagraphs as a proxy
+    for core throughput, which is an application of CoronagraphOptimizer
+    """
+
+    def __init__(self, coro):
+
+        # --- Discover variable elements in pupil → fpm → lyot_stop order ---
+        self._variable_elems = []  # [(attr_name, element), ...]
+        self._slices = []  # [slice into flat x, ...]
+        offset = 0
+
+        # Scan for pupil
+        for attr in ("pupil", "fpm", "lyot_stop"):
+            elem = getattr(coro, attr)
+            if hasattr(elem, "n_params"):
+                n = elem.n_params
+                self._variable_elems.append((attr, elem))
+                self._slices.append(slice(offset, offset + n))
+                offset += n
+        self.n_params = offset
+
+    def _push(self, x):
+        """Distribute *x* slices to their respective variable elements."""
+        for sl, (_, elem) in zip(self._slices, self._variable_elems):
+            elem.update(x[sl])
+
+    def fg(self, x):
+        """Evaluate cost *J* and gradient *dJ/dx* for parameter vector *x*."""
+        self._push(x)
+
+
 class CoronagraphOptimizer:
     """Coronagraph optimizer with automatic variable-element discovery.
 
@@ -418,3 +453,25 @@ class CoronagraphOptimizer:
             g[i] = (J_plus - J_minus) / (2.0 * eps)
         self._push(x)  # restore all elements to original x
         return g
+
+
+class JointOptimizer:
+    def __init__(self, optlist):
+        """
+        For performing joint optimization of multiple parameters
+        """
+        self.optlist = optlist
+
+    def fg(self, x):
+        """
+        Sums all of the functions and gradients
+        """
+        f = 0
+        g = np.zeros(x.shape)
+
+        for opt in self.optlist:
+            _f, _g = opt.fg(x)
+            f += _f
+            g += _g
+
+        return f, g
