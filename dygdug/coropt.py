@@ -248,17 +248,25 @@ class VariableLyotStop(Pupil):
 
 
 class ThroughputOptimizer:
-    """Coronagraph optimizer that sums the values in the apodizer
-    only meaningful for Amplitude-apodized coronagraphs as a proxy
-    for core throughput, which is an application of CoronagraphOptimizer
-    """
+    def __init__(self, coro, alpha=1.0):
+        """Coronagraph optimizer that sums the values in the apodizer
+        only meaningful for Amplitude-apodized coronagraphs as a proxy
+        for core throughput, which is an application of CoronagraphOptimizer
 
-    def __init__(self, coro):
+        Parameters
+        ----------
+        coro: `dygdug.models.Coronagraph`
+            Coronagraph model that contains a VariablePupil
+        alpha: float
+            optimization weight to multiply the throughput by
+        """
 
         # --- Discover variable elements in pupil → fpm → lyot_stop order ---
         self._variable_elems = []  # [(attr_name, element), ...]
         self._slices = []  # [slice into flat x, ...]
         offset = 0
+        self.alpha = alpha
+        self.coro = coro
 
         # Scan for pupil
         for attr in ("pupil", "fpm", "lyot_stop"):
@@ -278,6 +286,12 @@ class ThroughputOptimizer:
     def fg(self, x):
         """Evaluate cost *J* and gradient *dJ/dx* for parameter vector *x*."""
         self._push(x)
+
+        # simply sum the values in the pupil
+        f = -1 * np.sum(self.coro.pupil.data) * self.alpha
+        g = -1 * self.coro.pupil.data[self.coro.pupil.mask == 1] * self.alpha
+
+        return f, g
 
 
 class CoronagraphOptimizer:
@@ -453,6 +467,366 @@ class CoronagraphOptimizer:
             g[i] = (J_plus - J_minus) / (2.0 * eps)
         self._push(x)  # restore all elements to original x
         return g
+
+
+class AugmentedLagrangian:
+    """Augmented-Lagrangian optimizer for amplitude-apodized Lyot coronagraphs.
+
+    This implements the outer-loop structure used for constrained coronagraph
+    design problems such as Por, Proc. SPIE 12180, 121805J (2022): maximize an
+    amplitude apodizer throughput while imposing dark-hole contrast constraints.
+
+    For fixed Lagrange multipliers ``lambda`` and penalty ``rho``, the inner
+    optimizer minimizes
+
+    ``-throughput + 1/(2*rho) * sum(max(0, lambda + rho*c(x))**2 - lambda**2)``
+
+    where each inequality constraint is
+
+    ``c_i(x) = intensity_i(x) - contrast_i <= 0``.
+
+    After each inner solve, multipliers are updated with
+
+    ``lambda_i <- max(0, lambda_i + rho*c_i(x))``.
+
+    Notes
+    -----
+    This class intentionally supports only the current amplitude-apodized pupil
+    Lyot use case: ``coro.pupil`` must be a :class:`VariablePupil` in
+    ``'amplitude'`` mode, and FPM/Lyot-stop variables are not included in the
+    flat optimization vector.
+    """
+
+    def __init__(
+        self,
+        coro,
+        optimizer,
+        dark_hole,
+        wvl,
+        contrast,
+        x0=None,
+        lower_bounds=None,
+        upper_bounds=None,
+        penalty=1.0,
+        penalty_growth=10.0,
+        constraint_reduction=0.25,
+        constraint_tolerance=0.0,
+        throughput_weight=1.0,
+        normalize_throughput=False,
+        multipliers=None,
+        optimizer_kwargs=None,
+        include_fpm=True,
+    ):
+        """Create an augmented-Lagrangian optimization problem.
+
+        Parameters
+        ----------
+        coro : dygdug.models.Coronagraph
+            Coronagraph model.  Only ``coro.pupil`` is optimized, and it must
+            be a real-valued :class:`VariablePupil` in amplitude mode.
+        optimizer : callable
+            Optimizer class/factory from ``prysm.x.optym``.  For example,
+            pass ``PrysmLBFGSB`` rather than an already-stepped instance.
+        dark_hole : ndarray
+            Boolean or 0/1 mask selecting constrained focal-plane pixels.
+        wvl : float or sequence of float
+            Wavelength(s) included in the constraints.
+        contrast : float or ndarray
+            Maximum allowed intensity in the dark hole.  May be scalar, a
+            vector of dark-hole length, a full focal-plane image, or a
+            wavelength-indexed array of either form.
+        x0 : ndarray, optional
+            Initial pupil-amplitude vector.  Defaults to the current active
+            values in ``coro.pupil``.
+        lower_bounds, upper_bounds : ndarray or float, optional
+            Bounds passed to the inner optimizer.  Defaults to ``0 <= x <= 1``.
+        penalty : float, optional
+            Initial augmented-Lagrangian penalty ``rho``.
+        penalty_growth : float, optional
+            Factor used to increase ``rho`` when constraints do not improve.
+        constraint_reduction : float, optional
+            Required fractional improvement in max violation to avoid
+            increasing ``rho`` on the next outer iteration.
+        constraint_tolerance : float, optional
+            Violation below this value is considered feasible for penalty
+            update purposes.
+        throughput_weight : float, optional
+            Weight multiplying the negative throughput objective.
+        normalize_throughput : bool, optional
+            If True, optimize mean active-pupil transmission instead of sum.
+        multipliers : ndarray, optional
+            Initial nonnegative Lagrange multipliers.  Defaults to zero.
+        optimizer_kwargs : dict, optional
+            Extra keyword arguments forwarded to the inner optimizer.
+        include_fpm : bool, optional
+            Whether the coronagraph propagation includes the FPM.
+        """
+        if not isinstance(coro.pupil, VariablePupil):
+            raise TypeError(
+                "AugmentedLagrangian requires coro.pupil to be VariablePupil"
+            )
+        if coro.pupil.mode != "amplitude" or np.iscomplexobj(coro.pupil.data):
+            raise NotImplementedError(
+                "AugmentedLagrangian currently supports amplitude pupils only"
+            )
+        if hasattr(coro.fpm, "n_params") or hasattr(coro.lyot_stop, "n_params"):
+            raise NotImplementedError(
+                "AugmentedLagrangian currently optimizes only the pupil plane"
+            )
+
+        self.coro = coro
+        self.optimizer = optimizer
+        self.include_fpm = include_fpm
+        self.wvl = [wvl] if np.ndim(wvl) == 0 else list(wvl)
+
+        self.dh = np.asarray(dark_hole).astype(bool)
+        self._dh_idx = np.flatnonzero(self.dh.ravel())
+        if self._dh_idx.size == 0:
+            raise ValueError("dark_hole must select at least one focal-plane pixel")
+
+        self.pupil = coro.pupil
+        self._pupil_idx = getattr(
+            self.pupil, "_mask_idx", np.flatnonzero(self.pupil.mask.ravel())
+        )
+        self.n_params = int(self._pupil_idx.size)
+
+        if x0 is None:
+            self.x = self.pupil.data.ravel()[self._pupil_idx].astype(float).copy()
+        else:
+            self.x = np.asarray(x0, dtype=float).copy()
+        if self.x.size != self.n_params:
+            raise ValueError(f"x0 has length {self.x.size}, expected {self.n_params}")
+
+        self.lower_bounds = self._as_bound(lower_bounds, 0.0)
+        self.upper_bounds = self._as_bound(upper_bounds, 1.0)
+
+        self.contrast = self._prepare_contrast(contrast)
+        if multipliers is None:
+            self.multipliers = np.zeros_like(self.contrast)
+        else:
+            self.multipliers = np.asarray(multipliers, dtype=float).copy()
+            if self.multipliers.shape != self.contrast.shape:
+                raise ValueError(
+                    "multipliers must have shape "
+                    f"{self.contrast.shape}, got {self.multipliers.shape}"
+                )
+            self.multipliers = np.maximum(self.multipliers, 0)
+
+        self.penalty = float(penalty)
+        self.penalty_growth = float(penalty_growth)
+        self.constraint_reduction = float(constraint_reduction)
+        self.constraint_tolerance = float(constraint_tolerance)
+        self.throughput_weight = float(throughput_weight)
+        self.throughput_scale = self.throughput_weight
+        if normalize_throughput:
+            self.throughput_scale /= self.n_params
+        self.optimizer_kwargs = (
+            {} if optimizer_kwargs is None else dict(optimizer_kwargs)
+        )
+
+        self.outer_iter = 0
+        self.last_violation = None
+        self.last_inner_optimizer = None
+        self.history = []
+        self._Ebar = None
+
+        self._push(self.x)
+
+    def _as_bound(self, value, default):
+        """Return a length-``n_params`` bound vector."""
+        if value is None:
+            return np.full(self.n_params, default, dtype=float)
+        arr = np.asarray(value, dtype=float)
+        if arr.ndim == 0:
+            return np.full(self.n_params, float(arr), dtype=float)
+        if arr.size != self.n_params:
+            raise ValueError(f"bound has length {arr.size}, expected {self.n_params}")
+        return arr.copy()
+
+    def _prepare_contrast(self, contrast):
+        """Broadcast contrast input to ``(n_wavelengths, n_constraints)``."""
+        arr = np.asarray(contrast, dtype=float)
+        n_wvl = len(self.wvl)
+        n_constraints = self._dh_idx.size
+
+        if arr.ndim == 0:
+            return np.full((n_wvl, n_constraints), float(arr), dtype=float)
+
+        if arr.shape == self.dh.shape:
+            selected = arr.ravel()[self._dh_idx]
+            return np.tile(selected, (n_wvl, 1))
+
+        if arr.ndim == 1:
+            if arr.size == n_constraints:
+                return np.tile(arr.copy(), (n_wvl, 1))
+            if arr.size == n_wvl:
+                return np.repeat(arr[:, None], n_constraints, axis=1)
+
+        if arr.shape == (n_wvl, n_constraints):
+            return arr.copy()
+
+        if arr.ndim == self.dh.ndim + 1 and arr.shape[0] == n_wvl:
+            if arr.shape[1:] == self.dh.shape:
+                return np.asarray([plane.ravel()[self._dh_idx] for plane in arr])
+
+        raise ValueError(
+            "contrast must be scalar, full focal-plane shaped, dark-hole length, "
+            "wavelength length, or wavelength-indexed focal/dark-hole shaped"
+        )
+
+    def _push(self, x):
+        """Push an active-pupil vector into the coronagraph pupil."""
+        self.pupil.update(x)
+
+    def _zeroed_Ebar(self, like):
+        """Return a reusable zero-filled adjoint seed shaped like ``like``."""
+        if (
+            self._Ebar is None
+            or self._Ebar.shape != like.shape
+            or self._Ebar.dtype != like.dtype
+        ):
+            self._Ebar = np.zeros_like(like)
+        else:
+            self._Ebar.fill(0)
+        return self._Ebar
+
+    def fg(self, x):
+        """Evaluate the current augmented Lagrangian and gradient.
+
+        This method is passed to the inner ``prysm.x.optym`` optimizer.  The
+        Lagrange multipliers and penalty are fixed during each inner solve.
+        """
+        self._push(x)
+
+        f = -self.throughput_scale * np.sum(x)
+        g = np.full(self.n_params, -self.throughput_scale, dtype=float)
+
+        for iw, wvl in enumerate(self.wvl):
+            E_focal = self.coro.forward(wvl, include_fpm=self.include_fpm)
+            E_dh = E_focal.ravel()[self._dh_idx]
+            intensity = E_dh.real * E_dh.real + E_dh.imag * E_dh.imag
+            constraints = intensity - self.contrast[iw]
+
+            lam = self.multipliers[iw]
+            shifted = lam + self.penalty * constraints
+            positive = np.maximum(shifted, 0)
+            f += float(
+                (np.sum(positive * positive) - np.sum(lam * lam)) / (2 * self.penalty)
+            )
+
+            if np.any(positive > 0):
+                Ebar = self._zeroed_Ebar(E_focal)
+                Ebar.ravel()[self._dh_idx] = positive * E_dh
+                self.coro.reverse(Ebar, wvl, include_fpm=self.include_fpm)
+                adj = self.coro.adjoint_at_entrance_pupil.ravel()[self._pupil_idx]
+                g += 2 * np.real(adj)
+
+        return f, g
+
+    def constraint_values(self, x=None):
+        """Return ``intensity - contrast`` for every wavelength/dark-hole pixel."""
+        if x is not None:
+            self._push(x)
+
+        constraints = np.empty_like(self.contrast)
+        for iw, wvl in enumerate(self.wvl):
+            E_dh = self.coro.forward(wvl, include_fpm=self.include_fpm).ravel()[
+                self._dh_idx
+            ]
+            intensity = E_dh.real * E_dh.real + E_dh.imag * E_dh.imag
+            constraints[iw] = intensity - self.contrast[iw]
+        return constraints
+
+    def violation(self, constraints=None):
+        """Return maximum positive contrast-constraint violation."""
+        if constraints is None:
+            constraints = self.constraint_values()
+        return float(np.max(np.maximum(constraints, 0)))
+
+    def update_multipliers(self, constraints=None):
+        """Perform the nonnegative inequality multiplier update."""
+        if constraints is None:
+            constraints = self.constraint_values()
+        self.multipliers = np.maximum(0, self.multipliers + self.penalty * constraints)
+        return self.violation(constraints)
+
+    def _make_inner_optimizer(self, x0):
+        """Instantiate the configured inner optimizer for the current AL state."""
+        kwargs = dict(self.optimizer_kwargs)
+        kwargs.setdefault("lower_bounds", self.lower_bounds)
+        kwargs.setdefault("upper_bounds", self.upper_bounds)
+        return self.optimizer(self.fg, x0.copy(), **kwargs)
+
+    def step(self, inner_steps=50):
+        """Run one augmented-Lagrangian outer iteration.
+
+        Parameters
+        ----------
+        inner_steps : int, optional
+            Maximum number of inner optimizer ``step()`` calls for the current
+            multiplier/penalty state.
+
+        Returns
+        -------
+        x : ndarray
+            Current pupil-amplitude vector after the inner solve.
+        info : dict
+            Diagnostics for the completed outer iteration.
+        """
+        inner = self._make_inner_optimizer(self.x)
+        inner_iters = 0
+        inner_status = "max_inner_steps"
+
+        for _ in range(inner_steps):
+            try:
+                inner.step()
+                inner_iters += 1
+            except StopIteration:
+                inner_status = "stopped"
+                break
+
+        if not hasattr(inner, "x"):
+            raise AttributeError(
+                "inner optimizer must expose its current iterate as .x"
+            )
+
+        self.x = inner.x.copy()
+        self._push(self.x)
+        constraints = self.constraint_values()
+        max_violation = self.update_multipliers(constraints)
+
+        penalty_before = self.penalty
+        if (
+            self.last_violation is not None
+            and max_violation > self.constraint_tolerance
+            and max_violation > self.constraint_reduction * self.last_violation
+        ):
+            self.penalty *= self.penalty_growth
+
+        info = {
+            "outer_iter": self.outer_iter,
+            "inner_iters": inner_iters,
+            "inner_status": inner_status,
+            "max_violation": max_violation,
+            "penalty_before": penalty_before,
+            "penalty_after": self.penalty,
+            "multiplier_norm": float(
+                np.sqrt(np.sum(self.multipliers * self.multipliers))
+            ),
+            "throughput": float(np.sum(self.x)),
+        }
+
+        self.last_violation = max_violation
+        self.last_inner_optimizer = inner
+        self.history.append(info)
+        self.outer_iter += 1
+        return self.x, info
+
+    def solve(self, outer_steps=10, inner_steps=50):
+        """Run multiple augmented-Lagrangian outer iterations."""
+        for _ in range(outer_steps):
+            self.step(inner_steps=inner_steps)
+        return self.x, self.history
 
 
 class JointOptimizer:

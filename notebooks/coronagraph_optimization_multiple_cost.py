@@ -3,10 +3,15 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from prysm.mathops import np
 from prysm.propagation import focus_dft, prepare_executor, to_fpm_and_back
-from prysm.x.optym import PrysmLBFGSB
+from prysm.x.optym import LBFGSB, PrysmLBFGSB
 from tqdm import tqdm
 
-from dygdug.coropt import CoronagraphOptimizer, JointOptimizer, VariablePupil
+from dygdug.coropt import (
+    CoronagraphOptimizer,
+    JointOptimizer,
+    ThroughputOptimizer,
+    VariablePupil,
+)
 from dygdug.cost_functions import CoreThroughput, MeanSquaredErrorQuadratic
 from dygdug.masks import FPM, Pupil
 from dygdug.models import Coronagraph
@@ -93,12 +98,14 @@ contrast = CoronagraphOptimizer(
 # Draw a 0.7 lambda/D window
 core_window = FPM.lyot(Nfoc, lamD, px_per_lamD, 0.7)
 
-throughput = CoronagraphOptimizer(
-    dark_hole=1 - core_window(WVL),
-    coro=open_coro,
-    wvl=WVL,
-    cost=CoreThroughput(target=0, alpha=1e-20),  # max throughput
-)
+# throughput = CoronagraphOptimizer(
+#     dark_hole=1 - core_window(WVL),
+#     coro=open_coro,
+#     wvl=WVL,
+#     cost=CoreThroughput(target=0, alpha=1e-20),  # max throughput
+# )
+
+throughput = ThroughputOptimizer(coro, alpha=9e-11)
 
 optlist = [contrast, throughput]
 model = JointOptimizer(optlist)
@@ -107,9 +114,10 @@ x0 = pupil.data[pupil.mask].astype(float).copy()
 lb = np.zeros(contrast.n_params)
 ub = np.ones(contrast.n_params)
 
-opt = PrysmLBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub)
+# opt = PrysmLBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub, maxls=100)
+opt = LBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub)
 
-pbar = tqdm(range(1000))
+pbar = tqdm(range(5000))
 for i in pbar:
     x, f, g = opt.step()
     pbar.set_postfix(f=f)
