@@ -117,7 +117,7 @@ ub = np.ones(contrast.n_params)
 # opt = PrysmLBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub, maxls=100)
 opt = LBFGSB(model.fg, x0, lower_bounds=lb, upper_bounds=ub)
 
-pbar = tqdm(range(5000))
+pbar = tqdm(range(500))
 for i in pbar:
     x, f, g = opt.step()
     pbar.set_postfix(f=f)

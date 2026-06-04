@@ -1,7 +1,7 @@
 """Coronagraph optimizer."""
 
 from prysm import coordinates, geometry
-from prysm.mathops import np
+from prysm.mathops import ndimage, np
 
 from dygdug.cost_functions import MeanSquaredErrorQuadratic
 from dygdug.masks import FPM, Pupil
@@ -516,6 +516,7 @@ class AugmentedLagrangian:
         multipliers=None,
         optimizer_kwargs=None,
         include_fpm=True,
+        relaxation_sigma=None,
     ):
         """Create an augmented-Lagrangian optimization problem.
 
@@ -560,6 +561,15 @@ class AugmentedLagrangian:
             Extra keyword arguments forwarded to the inner optimizer.
         include_fpm : bool, optional
             Whether the coronagraph propagation includes the FPM.
+        relaxation_sigma : float or None, optional
+            Standard deviation in pixels of the Gaussian kernel applied for
+            progressive relaxation (Por, Proc. SPIE 12180, 121805J, 2022).
+            After each inner solve (except the final outer iteration) the
+            apodizer amplitude map is blurred by this kernel to smooth sharp
+            features and perturb the solution out of local minima before the
+            next inner solve begins.  The blur preserves the total active-pixel
+            sum and clips the result to the configured amplitude bounds.
+            Set to ``None`` (default) to disable progressive relaxation.
         """
         if not isinstance(coro.pupil, VariablePupil):
             raise TypeError(
@@ -624,12 +634,37 @@ class AugmentedLagrangian:
             {} if optimizer_kwargs is None else dict(optimizer_kwargs)
         )
 
+        self.relaxation_sigma = relaxation_sigma
+
         self.outer_iter = 0
         self.last_violation = None
         self.last_inner_optimizer = None
         self.history = []
         self._Ebar = None
 
+        # Starting point for the next inner solve.  Kept separate from
+        # ``self.x`` (the converged solution) so progressive relaxation can
+        # perturb the restart without corrupting the dual update (which must
+        # see the unperturbed inner optimum).
+        self._x_start = self.x.copy()
+
+        self._push(self.x)
+
+        # Contrast normalization: the dark-hole constraints are expressed as a
+        # true contrast relative to the peak of the direct (no-FPM) PSF.  The
+        # normalization is evaluated once here from the initial apodizer; it is
+        # not recomputed every forward pass.  Over the course of optimization
+        # the direct peak changes only at the ~10% level (it tracks throughput),
+        # which is negligible for constraint scaling.
+        self._normalization = np.empty(len(self.wvl), dtype=float)
+        for iw, wvl_ in enumerate(self.wvl):
+            E_direct = self.coro.forward(wvl_, include_fpm=False)
+            peak = float(np.max(E_direct.real * E_direct.real
+                                + E_direct.imag * E_direct.imag))
+            self._normalization[iw] = peak if peak > 0 else 1.0
+
+        # Restore the coronagraph state to the actual apodizer (forward above
+        # ran with include_fpm=False purely to measure the direct peak).
         self._push(self.x)
 
     def _as_bound(self, value, default):
@@ -704,7 +739,8 @@ class AugmentedLagrangian:
         for iw, wvl in enumerate(self.wvl):
             E_focal = self.coro.forward(wvl, include_fpm=self.include_fpm)
             E_dh = E_focal.ravel()[self._dh_idx]
-            intensity = E_dh.real * E_dh.real + E_dh.imag * E_dh.imag
+            norm = self._normalization[iw]
+            intensity = (E_dh.real * E_dh.real + E_dh.imag * E_dh.imag) / norm
             constraints = intensity - self.contrast[iw]
 
             lam = self.multipliers[iw]
@@ -715,8 +751,10 @@ class AugmentedLagrangian:
             )
 
             if np.any(positive > 0):
+                # Seed carries the 1/norm from c = intensity/norm - contrast:
+                # dJ/dE* = (dP/dc)(dc/dI)(dI/dE*) = positive * (1/norm) * E.
                 Ebar = self._zeroed_Ebar(E_focal)
-                Ebar.ravel()[self._dh_idx] = positive * E_dh
+                Ebar.ravel()[self._dh_idx] = (positive / norm) * E_dh
                 self.coro.reverse(Ebar, wvl, include_fpm=self.include_fpm)
                 adj = self.coro.adjoint_at_entrance_pupil.ravel()[self._pupil_idx]
                 g += 2 * np.real(adj)
@@ -734,7 +772,7 @@ class AugmentedLagrangian:
                 self._dh_idx
             ]
             intensity = E_dh.real * E_dh.real + E_dh.imag * E_dh.imag
-            constraints[iw] = intensity - self.contrast[iw]
+            constraints[iw] = intensity / self._normalization[iw] - self.contrast[iw]
         return constraints
 
     def violation(self, constraints=None):
@@ -750,6 +788,50 @@ class AugmentedLagrangian:
         self.multipliers = np.maximum(0, self.multipliers + self.penalty * constraints)
         return self.violation(constraints)
 
+    def _apply_relaxation(self, x):
+        """Blur the apodizer amplitude map with a Gaussian to escape local minima.
+
+        The blurred solution is energy-preserving: the total sum of the
+        active-pixel transmission values is unchanged.  Pixel values are then
+        clipped to the configured ``[lower_bounds, upper_bounds]`` range so that
+        the smoothed starting point remains feasible.
+
+        Parameters
+        ----------
+        x : ndarray
+            Current active-pupil amplitude vector (length ``n_params``).
+
+        Returns
+        -------
+        x_smooth : ndarray
+            Smoothed amplitude vector, same length as *x*.
+        """
+        # Reconstruct the full 2-D amplitude map (zeros outside the pupil).
+        shape = self.pupil.data.shape
+        img = np.zeros(shape, dtype=float)
+        img.flat[self._pupil_idx] = x
+
+        # Apply isotropic Gaussian blur.  Values stay in [0, 1] because the
+        # kernel is normalized and inputs are non-negative, so boundary pixels
+        # can only decrease toward zero — never exceed the original maximum.
+        # ndimage is the prysm backend shim: scipy.ndimage on CPU, cupyx.scipy.ndimage on GPU.
+        blurred = ndimage.gaussian_filter(img, sigma=self.relaxation_sigma)
+
+        # Extract active-pixel values from the blurred image.
+        x_smooth = blurred.flat[self._pupil_idx].copy()
+
+        # Re-scale to preserve the total active-pixel transmission (energy).
+        # Boundary bleed reduces the in-pupil sum slightly; undo that effect.
+        s_orig = float(np.sum(x))
+        s_smooth = float(np.sum(x_smooth))
+        if s_smooth > 0:
+            x_smooth = x_smooth * (s_orig / s_smooth)
+
+        # Clip to configured amplitude bounds [0, 1] after rescaling.
+        x_smooth = np.clip(x_smooth, self.lower_bounds, self.upper_bounds)
+
+        return x_smooth
+
     def _make_inner_optimizer(self, x0):
         """Instantiate the configured inner optimizer for the current AL state."""
         kwargs = dict(self.optimizer_kwargs)
@@ -757,7 +839,7 @@ class AugmentedLagrangian:
         kwargs.setdefault("upper_bounds", self.upper_bounds)
         return self.optimizer(self.fg, x0.copy(), **kwargs)
 
-    def step(self, inner_steps=50):
+    def step(self, inner_steps=50, apply_relaxation=True, progress=False):
         """Run one augmented-Lagrangian outer iteration.
 
         Parameters
@@ -765,6 +847,16 @@ class AugmentedLagrangian:
         inner_steps : int, optional
             Maximum number of inner optimizer ``step()`` calls for the current
             multiplier/penalty state.
+        progress : bool, optional
+            If True, display a ``tqdm`` progress bar over the inner optimizer
+            steps.  Requires ``tqdm`` to be installed.
+        apply_relaxation : bool, optional
+            Whether to apply progressive relaxation (Gaussian smoothing) when
+            forming the starting point for the *next* inner solve, if
+            ``relaxation_sigma`` was set.  The converged solution returned by
+            this call (``self.x``) and the dual update are never perturbed, so
+            this only affects where the next inner solve begins.  Pass ``False``
+            on the final outer iteration to skip the (then-pointless) blur.
 
         Returns
         -------
@@ -773,9 +865,19 @@ class AugmentedLagrangian:
         info : dict
             Diagnostics for the completed outer iteration.
         """
-        inner = self._make_inner_optimizer(self.x)
+        inner = self._make_inner_optimizer(self._x_start)
         inner_iters = 0
         inner_status = "max_inner_steps"
+
+        pbar = None
+        if progress:
+            from tqdm import tqdm
+
+            pbar = tqdm(
+                total=inner_steps,
+                desc=f"inner (outer {self.outer_iter})",
+                leave=False,
+            )
 
         for _ in range(inner_steps):
             try:
@@ -784,6 +886,11 @@ class AugmentedLagrangian:
             except StopIteration:
                 inner_status = "stopped"
                 break
+            if pbar is not None:
+                pbar.update(1)
+
+        if pbar is not None:
+            pbar.close()
 
         if not hasattr(inner, "x"):
             raise AttributeError(
@@ -792,6 +899,12 @@ class AugmentedLagrangian:
 
         self.x = inner.x.copy()
         self._push(self.x)
+
+        # Dual update first, on the *converged* inner solution.  Multipliers and
+        # the penalty must reflect the true constraint values at the inner
+        # optimum; computing them after a relaxation blur would feed the
+        # perturbation artifacts (which raise dark-hole intensity) straight into
+        # the multipliers and inflate the penalty.
         constraints = self.constraint_values()
         max_violation = self.update_multipliers(constraints)
 
@@ -802,6 +915,17 @@ class AugmentedLagrangian:
             and max_violation > self.constraint_reduction * self.last_violation
         ):
             self.penalty *= self.penalty_growth
+
+        # Progressive relaxation: blur the apodizer to perturb the *next* inner
+        # solve out of local minima.  Only the starting point for the next solve
+        # is perturbed; ``self.x`` (the converged/returned solution) and the dual
+        # update above are left untouched.  Skipped on the final outer iteration.
+        relaxation_applied = False
+        if apply_relaxation and self.relaxation_sigma is not None:
+            self._x_start = self._apply_relaxation(self.x)
+            relaxation_applied = True
+        else:
+            self._x_start = self.x.copy()
 
         info = {
             "outer_iter": self.outer_iter,
@@ -814,6 +938,7 @@ class AugmentedLagrangian:
                 np.sqrt(np.sum(self.multipliers * self.multipliers))
             ),
             "throughput": float(np.sum(self.x)),
+            "relaxation_applied": relaxation_applied,
         }
 
         self.last_violation = max_violation
@@ -822,10 +947,33 @@ class AugmentedLagrangian:
         self.outer_iter += 1
         return self.x, info
 
-    def solve(self, outer_steps=10, inner_steps=50):
-        """Run multiple augmented-Lagrangian outer iterations."""
-        for _ in range(outer_steps):
-            self.step(inner_steps=inner_steps)
+    def solve(self, outer_steps=10, inner_steps=50, progress=False):
+        """Run multiple augmented-Lagrangian outer iterations.
+
+        Progressive relaxation (if ``relaxation_sigma`` is set) is applied
+        after every inner solve *except* the last outer iteration, so the
+        final returned solution is the direct optimizer output without any
+        post-processing blur.
+
+        Parameters
+        ----------
+        progress : bool, optional
+            If True, display ``tqdm`` progress bars over both the outer
+            iterations and each inner solve.  Requires ``tqdm`` installed.
+        """
+        outer_iterator = range(outer_steps)
+        if progress:
+            from tqdm import tqdm
+
+            outer_iterator = tqdm(outer_iterator, desc="outer")
+
+        for i in outer_iterator:
+            is_last = i == outer_steps - 1
+            self.step(
+                inner_steps=inner_steps,
+                apply_relaxation=not is_last,
+                progress=progress,
+            )
         return self.x, self.history
 
 
