@@ -8,6 +8,7 @@ from prysm.propagation import prepare_executor
 from prysm.x.optym import PrysmLBFGSB
 from tqdm import tqdm
 
+from dygdug.backend import asnumpy
 from dygdug.coropt import AugmentedLagrangian, VariablePupil
 from dygdug.masks import FPM, Pupil
 from dygdug.models import Coronagraph
@@ -28,14 +29,17 @@ def _frame_data(coro, pupil, wvl, direct_peak):
     iterations) of the apodizer amplitude and the coronagraphic focal-plane
     intensity normalized to the direct (no-FPM) peak.
     """
-    apodizer = np.asarray(pupil.data)
+    apodizer = pupil.data
     if np.iscomplexobj(apodizer):
         apodizer = np.abs(apodizer)
 
     E_focal = coro.forward(wvl, include_fpm=True)
     intensity = (np.abs(E_focal) ** 2) / direct_peak
 
-    return np.array(apodizer, copy=True), np.array(intensity, copy=True)
+    # Pull to host numpy (a no-op copy on CPU, a device->host transfer under
+    # cupy) so matplotlib can render it, and so later iterations mutating the
+    # device arrays do not alias these frames.
+    return asnumpy(apodizer).copy(), asnumpy(intensity).copy()
 
 
 def _save_animation(frames, gif_path, fps=4):

@@ -3,6 +3,7 @@
 from prysm import coordinates, geometry
 from prysm.mathops import ndimage, np
 
+from dygdug.backend import sync_coronagraph
 from dygdug.cost_functions import MeanSquaredErrorQuadratic
 from dygdug.masks import FPM, Pupil
 
@@ -268,6 +269,9 @@ class ThroughputOptimizer:
         self.alpha = alpha
         self.coro = coro
 
+        # One-time backend sync so a GPU pupil/Lyot/executor stay on-device.
+        sync_coronagraph(coro)
+
         # Scan for pupil
         for attr in ("pupil", "fpm", "lyot_stop"):
             elem = getattr(coro, attr)
@@ -327,6 +331,10 @@ class CoronagraphOptimizer:
 
         # Accept a scalar or a sequence of wavelengths.
         self.wvl = [wvl] if np.ndim(wvl) == 0 else list(wvl)
+
+        # One-time backend sync (see AugmentedLagrangian): keep the inner
+        # forward/reverse loop entirely on the active prysm backend.  No-op on CPU.
+        sync_coronagraph(coro, self.wvl)
 
         # Accept the cost-function class or an already-constructed instance.
         self.cost_fn = cost() if isinstance(cost, type) else cost
@@ -588,6 +596,11 @@ class AugmentedLagrangian:
         self.optimizer = optimizer
         self.include_fpm = include_fpm
         self.wvl = [wvl] if np.ndim(wvl) == 0 else list(wvl)
+
+        # One-time: move the coronagraph's persistent arrays (pupil, Lyot stop,
+        # FPM cache, executor matrices) onto the active prysm backend so the
+        # inner forward/reverse loop runs entirely on-device.  No-op on CPU.
+        sync_coronagraph(coro, self.wvl)
 
         self.dh = np.asarray(dark_hole).astype(bool)
         self._dh_idx = np.flatnonzero(self.dh.ravel())
