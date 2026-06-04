@@ -1,6 +1,7 @@
 import os
 
 import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.colors import LogNorm
 from prysm.mathops import np
 from prysm.propagation import prepare_executor
@@ -11,8 +12,8 @@ from dygdug.coropt import AugmentedLagrangian, VariablePupil
 from dygdug.masks import FPM, Pupil
 from dygdug.models import Coronagraph
 
-# Directory where per-inner-iteration progress figures are written.
-FIGURE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "al_progress")
+# Animated GIF written at the end of the run, one frame per inner solve.
+GIF_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "al_progress.gif")
 
 # Fixed log-intensity display range so frames are comparable across iterations.
 # Brackets the 1e-8 contrast target with a couple decades of headroom.
@@ -20,15 +21,12 @@ _DISPLAY_VMIN = 1e-11
 _DISPLAY_VMAX = 1e-3
 
 
-def _save_progress_figure(coro, pupil, wvl, direct_peak, outer_iter, outdir):
-    """Save the apodizer and log-scaled coronagraphic intensity for one outer iter.
+def _frame_data(coro, pupil, wvl, direct_peak):
+    """Snapshot the apodizer and normalized coronagraphic intensity.
 
-    Left panel: the apodizer amplitude solution (gray, linear, with colorbar).
-    Right panel: the coronagraphic focal-plane intensity, normalized to the
-    direct (no-FPM) peak and shown on a fixed log scale (inferno, with colorbar).
-
-    Called at the conclusion of each inner optimization so the saved frames
-    track convergence of the design.
+    Returns owned copies (the underlying arrays are mutated by later
+    iterations) of the apodizer amplitude and the coronagraphic focal-plane
+    intensity normalized to the direct (no-FPM) peak.
     """
     apodizer = np.asarray(pupil.data)
     if np.iscomplexobj(apodizer):
@@ -37,16 +35,28 @@ def _save_progress_figure(coro, pupil, wvl, direct_peak, outer_iter, outdir):
     E_focal = coro.forward(wvl, include_fpm=True)
     intensity = (np.abs(E_focal) ** 2) / direct_peak
 
+    return np.array(apodizer, copy=True), np.array(intensity, copy=True)
+
+
+def _save_animation(frames, gif_path, fps=4):
+    """Animate the collected frames vs. outer iteration and write a GIF.
+
+    Left panel: the apodizer amplitude solution (gray, linear, with colorbar).
+    Right panel: the coronagraphic focal-plane intensity, normalized to the
+    direct peak, on a fixed log scale (inferno, with colorbar).
+    """
+    apod0, int0 = frames[0]
+
     fig, (ax_apod, ax_int) = plt.subplots(1, 2, figsize=(11, 5))
 
-    im_apod = ax_apod.imshow(apodizer, cmap="gray")
+    im_apod = ax_apod.imshow(apod0, cmap="gray", vmin=0.0, vmax=1.0)
     ax_apod.set_title("apodizer")
     ax_apod.set_xticks([])
     ax_apod.set_yticks([])
     fig.colorbar(im_apod, ax=ax_apod, fraction=0.046, pad=0.04)
 
     im_int = ax_int.imshow(
-        intensity,
+        int0,
         cmap="inferno",
         norm=LogNorm(vmin=_DISPLAY_VMIN, vmax=_DISPLAY_VMAX),
     )
@@ -55,9 +65,18 @@ def _save_progress_figure(coro, pupil, wvl, direct_peak, outer_iter, outdir):
     ax_int.set_yticks([])
     fig.colorbar(im_int, ax=ax_int, fraction=0.046, pad=0.04)
 
-    fig.suptitle(f"outer iteration {outer_iter}")
+    title = fig.suptitle("outer iteration 0")
     fig.tight_layout()
-    fig.savefig(os.path.join(outdir, f"outer_{outer_iter:03d}.png"), dpi=120)
+
+    def update(k):
+        apod, intensity = frames[k]
+        im_apod.set_data(apod)
+        im_int.set_data(intensity)
+        title.set_text(f"outer iteration {k}")
+        return im_apod, im_int, title
+
+    anim = FuncAnimation(fig, update, frames=len(frames), blit=False)
+    anim.save(gif_path, writer=PillowWriter(fps=fps))
     plt.close(fig)
 
 
@@ -66,8 +85,8 @@ def test_augmented_lagrangian_runs_multiple_outer_iterations_on_segmented_pupil(
 
     This follows ``notebooks/coronagraph_optimization_multiple_cost.py`` but
     uses smaller pupil/focal arrays so the test exercises the outer AL loop
-    without becoming a long optimization benchmark.  A progress figure is
-    written to ``tests/al_progress/`` at the conclusion of each inner solve.
+    without becoming a long optimization benchmark.  An animated GIF tracking
+    the design vs. iteration is written to ``tests/al_progress.gif``.
     """
     circumscribed_diameter = 7.994 * 1e3
     efl = 10 * circumscribed_diameter
@@ -82,8 +101,8 @@ def test_augmented_lagrangian_runs_multiple_outer_iterations_on_segmented_pupil(
     exclude = [37, 41, 45, 49, 53, 57]
 
     # Outer/inner iteration budget.  Modest by default so the script stays
-    # runnable and produces a manageable number of progress frames; bump these
-    # up for a real design run.
+    # runnable and produces a manageable animation; bump these up for a real
+    # design run.
     n_outer = 20
     n_inner = 500
 
@@ -137,25 +156,26 @@ def test_augmented_lagrangian_runs_multiple_outer_iterations_on_segmented_pupil(
         relaxation_sigma=5,
     )
 
-    os.makedirs(FIGURE_DIR, exist_ok=True)
-
     # Display normalization: central wavelength's direct-PSF peak, captured by
     # the optimizer at construction time (does not change appreciably during
     # the solve).  wvl list is [0.95 w, w, 1.05 w] -> central index is 1.
     direct_peak = float(model._normalization[1])
 
-    # Drive the outer loop manually so a figure is saved after each inner solve.
+    # Drive the outer loop manually so a frame is captured after each inner solve.
     # Relaxation perturbs only the next inner solve's starting point, so it is
     # disabled on the final outer iteration (matching AugmentedLagrangian.solve).
     # tqdm bars: the outer loop here, the inner loop inside model.step(progress=True).
+    frames = []
     for i in tqdm(range(n_outer), desc="outer"):
         is_last = i == n_outer - 1
         model.step(inner_steps=n_inner, apply_relaxation=not is_last, progress=True)
-        _save_progress_figure(coro, pupil, wvl, direct_peak, i, FIGURE_DIR)
+        frames.append(_frame_data(coro, pupil, wvl, direct_peak))
 
     x = model.x
     pupil.update(x)
-    print(f"saved {n_outer} progress figures to {FIGURE_DIR}")
+
+    _save_animation(frames, GIF_PATH)
+    print(f"saved {n_outer}-frame animation to {GIF_PATH}")
     return
 
 
