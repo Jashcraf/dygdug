@@ -359,7 +359,7 @@ def test_joint_mse_throughput_binary():
     # dark-hole-feasible solutions -- sweep mu around this value to trade
     # contrast vs throughput/binarity.
     alpha_mse = 1.0
-    mu = 1e-20#9e-11
+    mu = 9e-11
 
     # Outer/inner budget.  Each outer iteration runs an inner PrysmLBFGSB solve
     # of the weighted-sum objective; between solves the converged apodizer is
@@ -444,8 +444,8 @@ def test_joint_mse_throughput_binary():
     xf = x0
     frames = []
     t1 = perf_counter()
-    outer_bar = tqdm(range(n_outer), desc="outer")
-    for i in outer_bar:
+    inner_bar = tqdm(range(n_inner), desc="inner L-BFGS-B")
+    for i in range(n_outer):
         is_last = i == n_outer - 1
 
         opt = PrysmLBFGSB(
@@ -455,7 +455,7 @@ def test_joint_mse_throughput_binary():
             upper_bounds=np.ones(x0.size),
             maxls=10,
         )
-        for _ in range(n_inner):
+        for _ in inner_bar:
             try:
                 opt.step()
             except StopIteration:
@@ -471,7 +471,7 @@ def test_joint_mse_throughput_binary():
             sigma_k = sigma0 * (sigma_min / sigma0) ** (i / max(n_outer - 1, 1))
             x_start = _apply_relaxation(xf, pupil_idx, shape, sigma_k)
 
-        outer_bar.set_postfix(
+        inner_bar.set_postfix(
             thpt=f"{float(np.mean(xf)):.3f}",
             nbin=f"{float(np.mean((xf < 0.05) | (xf > 0.95))):.0%}",
         )
