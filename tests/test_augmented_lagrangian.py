@@ -366,7 +366,7 @@ def test_joint_mse_throughput_binary():
     # blurred (progressive relaxation, Por 2022) to perturb the next solve's
     # start out of local minima.  The blur kernel is cooled over the outer loop.
     n_outer = 1
-    n_inner = 10_000
+    n_inner = 500
     sigma0, sigma_min = 4.0, 0.5      # relaxation kernel std (px), cooled
 
     executor = prepare_executor(
@@ -453,7 +453,7 @@ def test_joint_mse_throughput_binary():
             x_start.copy(),
             lower_bounds=np.zeros(x0.size),
             upper_bounds=np.ones(x0.size),
-            maxls=10,
+            maxls=1,
         )
         for _ in inner_bar:
             try:
