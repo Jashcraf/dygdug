@@ -1,3 +1,4 @@
+"""optim is now included in x.prysm.optym, so this version is no longer supported"""
 import warnings
 
 from scipy.optimize import _lbfgsb
