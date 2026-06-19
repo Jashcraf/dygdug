@@ -82,7 +82,7 @@ class Coronagraph:
             The complex field at the entrance pupil
         """
 
-        self.adjoint_at_lyot = propagation.focus_dft_backprop(
+        self.adjoint_at_lyot = propagation.focus_dft_adjoint(
             Ebar,
             executor=self.executor,
         )
@@ -98,7 +98,7 @@ class Coronagraph:
         # to avoid adjointing the same function multiple times. Prysm's
         # backpropagator applies the complex conjugate of the FPM internally.
         fpm = self.fpm(wvl) if include_fpm else np.ones_like(self.fpm(wvl))
-        self.adjoint_at_entrance_pupil = propagation.to_fpm_and_back_backprop(
+        self.adjoint_at_entrance_pupil = propagation.to_fpm_and_back_adjoint(
             self.adjoint_at_lyot,
             fpm,
             executor=self.executor,

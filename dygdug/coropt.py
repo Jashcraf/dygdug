@@ -2,9 +2,19 @@
 
 from prysm import coordinates, geometry
 from prysm.mathops import ndimage, np
+from prysm.x.optym.governors import (
+    AnyGovernor,
+    FunctionTolerance,
+    GradientTolerance,
+    StepRecord,
+)
 
 from dygdug.backend import sync_coronagraph
-from dygdug.cost_functions import MeanSquaredErrorQuadratic
+from dygdug.cost_functions import (
+    FieldBoxConstraint,
+    IntensityConstraint,
+    MeanSquaredErrorQuadratic,
+)
 from dygdug.masks import FPM, Pupil
 
 
@@ -319,7 +329,20 @@ class CoronagraphOptimizer:
         Wavelength(s) to include.  Cost and gradient are summed over all
         wavelengths.
     cost : cost-function class or instance, optional
-        Must expose ``.forward(I)`` → scalar and ``.reverse(I)`` → array.
+        Must expose ``.forward`` → scalar and ``.reverse`` → array.  The
+        ``domain`` class attribute (see :mod:`dygdug.cost_functions`) selects
+        what the cost consumes:
+
+        ``"intensity"`` (default)
+            ``forward(I)`` / ``reverse(I)`` operate on the dark-hole intensity
+            ``I = |E|^2``; ``reverse`` returns ``dJ/dI``.
+
+        ``"field"``
+            ``forward(E)`` / ``reverse(E)`` operate on the complex dark-hole
+            field, so the real and imaginary parts can be constrained
+            independently (e.g. :class:`FieldMeanSquaredError`).  ``reverse``
+            returns the Wirtinger seed ``dJ/dE*``.
+
         Defaults to :class:`MeanSquaredErrorQuadratic`.
     """
 
@@ -338,6 +361,14 @@ class CoronagraphOptimizer:
 
         # Accept the cost-function class or an already-constructed instance.
         self.cost_fn = cost() if isinstance(cost, type) else cost
+        # Domain decides whether the cost consumes intensity |E|^2 or the
+        # complex field E directly (see dygdug.cost_functions).  Unmarked costs
+        # are treated as intensity for backward compatibility.
+        self.cost_domain = getattr(self.cost_fn, "domain", "intensity")
+        if self.cost_domain not in ("intensity", "field"):
+            raise ValueError(
+                f"cost domain must be 'intensity' or 'field', got {self.cost_domain!r}"
+            )
 
         # --- Discover variable elements in pupil → fpm → lyot_stop order ---
         self._variable_elems = []  # [(attr_name, element), ...]
@@ -389,14 +420,21 @@ class CoronagraphOptimizer:
         grad = np.zeros(self.n_params)
 
         for wvl in self.wvl:
-            # Evaluate cost function on dh intensity
             E_focal = self.coro.forward(wvl, include_fpm=True)
-            I_dh = np.abs(E_focal[self.dh]) ** 2
-            J += float(self.cost_fn.forward(I_dh))
-
-            # Wirtinger gradient at focal plane: dJ/dE* = (dJ/dI) · E.
+            E_dh = E_focal[self.dh]
             Ebar = np.zeros_like(E_focal)
-            Ebar[self.dh] = self.cost_fn.reverse(I_dh) * E_focal[self.dh]
+
+            if self.cost_domain == "field":
+                # Field-domain cost: forward/reverse consume the complex field
+                # directly and reverse returns the Wirtinger seed dJ/dE*.
+                J += float(self.cost_fn.forward(E_dh))
+                Ebar[self.dh] = self.cost_fn.reverse(E_dh)
+            else:
+                # Intensity-domain cost on the dark-hole intensity I = |E|^2.
+                # Wirtinger gradient at focal plane: dJ/dE* = (dJ/dI) · E.
+                I_dh = np.abs(E_dh) ** 2
+                J += float(self.cost_fn.forward(I_dh))
+                Ebar[self.dh] = self.cost_fn.reverse(I_dh) * E_dh
 
             # Back-propagate gradient to pupil plane (return value is 2D;
             # relevant slices are extracted below by the per-element helpers).
@@ -454,8 +492,11 @@ class CoronagraphOptimizer:
         self._push(x)
         J = 0.0
         for wvl in self.wvl:
-            I_dh = np.abs(self.coro.forward(wvl, include_fpm=True)[self.dh]) ** 2
-            J += float(self.cost_fn.forward(I_dh))
+            E_dh = self.coro.forward(wvl, include_fpm=True)[self.dh]
+            if self.cost_domain == "field":
+                J += float(self.cost_fn.forward(E_dh))
+            else:
+                J += float(self.cost_fn.forward(np.abs(E_dh) ** 2))
         return J
 
     def _fd_grad(self, x, sl, eps=1e-7):
@@ -489,9 +530,14 @@ class AugmentedLagrangian:
 
     ``-throughput + 1/(2*rho) * sum(max(0, lambda + rho*c(x))**2 - lambda**2)``
 
-    where each inequality constraint is
+    where each inequality constraint defaults to
 
     ``c_i(x) = intensity_i(x) - contrast_i <= 0``.
+
+    The constrained quantity is pluggable via ``constraint`` (or the
+    ``constraint_kind`` shorthand): pass any object following the constraint
+    protocol in :mod:`dygdug.cost_functions` to bound, e.g., the real and
+    imaginary parts of the dark-hole field instead of its intensity.
 
     After each inner solve, multipliers are updated with
 
@@ -521,10 +567,17 @@ class AugmentedLagrangian:
         constraint_tolerance=0.0,
         throughput_weight=1.0,
         normalize_throughput=False,
+        binarize_weight=0.0,
+        binarize_kind="quadratic",
+        constraint_kind="intensity",
+        constraint=None,
         multipliers=None,
         optimizer_kwargs=None,
         include_fpm=True,
         relaxation_sigma=None,
+        ftol=None,
+        gtol=None,
+        governor_factory=None,
     ):
         """Create an augmented-Lagrangian optimization problem.
 
@@ -563,6 +616,43 @@ class AugmentedLagrangian:
             Weight multiplying the negative throughput objective.
         normalize_throughput : bool, optional
             If True, optimize mean active-pupil transmission instead of sum.
+        binarize_weight : float, optional
+            Weight of a double-well penalty ``beta * sum((x - l)(u - x))`` that
+            drives pixels toward the bounds for a near-binary apodizer.  Default
+            0 (off).  Mutable as ``model.binarize_weight`` so it can be annealed
+            up across outer iterations; normalized like throughput, so it trades
+            off against ``throughput_weight`` on a common scale.
+        binarize_kind : {'quadratic', 'tent'}, optional
+            Shape of the binarization penalty.  ``'quadratic'`` (default) is the
+            smooth double well ``(x - l)(u - x)`` whose force vanishes at
+            mid-gray.  ``'tent'`` is the nearest-bound distance
+            ``min(x - l, u - x)``, which applies constant force ``+-beta``
+            toward the nearest bound everywhere (including mid-gray), so it
+            binarizes stuck mid-gray pixels far more aggressively.
+        constraint_kind : {'intensity', 'field'}, optional
+            Convenience selector for a built-in dark-hole constraint, used only
+            when ``constraint`` is None.  ``'intensity'`` (default) bounds
+            ``|E|^2 / norm <= contrast`` -- a convex quadratic whose optimum lies
+            on a smooth boundary (gray).  ``'field'`` bounds the normalized field
+            amplitude components linearly, ``|Re a| <= s`` and ``|Im a| <= s``
+            with ``a = E / sqrt(norm)`` and ``s = sqrt(contrast / 2)``: a linear
+            program whose feasible polytope has binary vertices, so throughput
+            maximization drives a binary apodizer.  ``contrast`` keeps the same
+            meaning (max intensity relative to the direct peak) in both modes.
+            In field mode the multipliers have shape ``(n_wvl, 2, n)`` (axis 1
+            indexes real/imag).  Maps to :class:`IntensityConstraint` /
+            :class:`FieldBoxConstraint` respectively.
+        constraint : constraint object or class, optional
+            Pluggable dark-hole constraint that *replaces* ``constraint_kind``
+            when given.  Must follow the constraint protocol in
+            :mod:`dygdug.cost_functions` -- ``multiplier_shape(n_wvl, n)``,
+            ``residual(E_dh, norm, contrast)`` (per-pixel values, ``<= 0``
+            feasible), and ``grad_seed(E_dh, norm, contrast, positive)`` (the
+            Wirtinger seed ``dJ/dE*`` of the active constraints).  This lets the
+            constrained quantity itself be defined on the electric field -- e.g.
+            bounding the real and imaginary parts -- rather than on intensity.
+            The multiplier shape and ``constraint_values`` shape follow the
+            object's ``multiplier_shape``.
         multipliers : ndarray, optional
             Initial nonnegative Lagrange multipliers.  Defaults to zero.
         optimizer_kwargs : dict, optional
@@ -578,6 +668,23 @@ class AugmentedLagrangian:
             next inner solve begins.  The blur preserves the total active-pixel
             sum and clips the result to the configured amplitude bounds.
             Set to ``None`` (default) to disable progressive relaxation.
+        ftol : float, optional
+            If set, end an inner solve early once consecutive inner-objective
+            values change by less than this (relative) tolerance, via a
+            ``prysm.x.optym.governors.FunctionTolerance``.  ``None`` (default)
+            disables this stop condition.
+        gtol : float, optional
+            If set, end an inner solve early once the inner-objective gradient
+            infinity-norm falls below this value, via a ``GradientTolerance``.
+            ``None`` (default) disables this stop condition.
+        governor_factory : callable, optional
+            Zero-argument callable returning a fresh
+            ``prysm.x.optym.governors.Governor`` for each inner solve.  Use
+            this for full control over the stop conditions (e.g. ``StepTolerance``,
+            ``MaxEvaluations``, or a custom ``AllGovernor``).  When given, it
+            takes precedence over ``ftol``/``gtol``.  The factory is called once
+            per inner solve so per-solve governor state does not leak across
+            outer iterations.
         """
         if not isinstance(coro.pupil, VariablePupil):
             raise TypeError(
@@ -594,6 +701,14 @@ class AugmentedLagrangian:
 
         self.coro = coro
         self.optimizer = optimizer
+        # Inner-solve stop conditions (prysm governors).  Disabled by default
+        # (ftol/gtol None and no factory) so the inner loop runs the full
+        # ``inner_steps`` budget unless the optimizer self-terminates.  A fresh
+        # governor is built per inner solve via ``_make_governor`` so tolerance
+        # state does not leak across outer iterations.
+        self.ftol = ftol
+        self.gtol = gtol
+        self._governor_factory = governor_factory
         self.include_fpm = include_fpm
         self.wvl = [wvl] if np.ndim(wvl) == 0 else list(wvl)
 
@@ -623,15 +738,42 @@ class AugmentedLagrangian:
         self.lower_bounds = self._as_bound(lower_bounds, 0.0)
         self.upper_bounds = self._as_bound(upper_bounds, 1.0)
 
+        # Resolve the dark-hole constraint object.  An explicit ``constraint``
+        # (instance or class) takes precedence; otherwise ``constraint_kind``
+        # selects a built-in.  The object owns the constraint residual, its
+        # field-gradient seed, and the multiplier shape, so ``fg`` and
+        # ``constraint_values`` stay agnostic to intensity vs. field.
+        if constraint is None:
+            if constraint_kind not in ("intensity", "field"):
+                raise ValueError(
+                    f"constraint_kind must be 'intensity' or 'field', got "
+                    f"{constraint_kind!r}"
+                )
+            self.constraint = (
+                FieldBoxConstraint()
+                if constraint_kind == "field"
+                else IntensityConstraint()
+            )
+        else:
+            self.constraint = constraint() if isinstance(constraint, type) else constraint
+        self.constraint_kind = constraint_kind
+
         self.contrast = self._prepare_contrast(contrast)
+        # Multiplier (and constraint) shape is delegated to the constraint
+        # object.  Intensity: one inequality per dark-hole pixel per wavelength,
+        # (n_wvl, n).  Field (LP): two -- |Re a| <= s and |Im a| <= s -- so an
+        # extra axis of size 2 (0 -> real, 1 -> imag), (n_wvl, 2, n).
+        n_wvl, n_constraints = self.contrast.shape
+        mult_shape = tuple(self.constraint.multiplier_shape(n_wvl, n_constraints))
+        self._mult_shape = mult_shape
         if multipliers is None:
-            self.multipliers = np.zeros_like(self.contrast)
+            self.multipliers = np.zeros(mult_shape, dtype=float)
         else:
             self.multipliers = np.asarray(multipliers, dtype=float).copy()
-            if self.multipliers.shape != self.contrast.shape:
+            if self.multipliers.shape != mult_shape:
                 raise ValueError(
-                    "multipliers must have shape "
-                    f"{self.contrast.shape}, got {self.multipliers.shape}"
+                    f"multipliers must have shape {mult_shape}, "
+                    f"got {self.multipliers.shape}"
                 )
             self.multipliers = np.maximum(self.multipliers, 0)
 
@@ -643,6 +785,19 @@ class AugmentedLagrangian:
         self.throughput_scale = self.throughput_weight
         if normalize_throughput:
             self.throughput_scale /= self.n_params
+
+        # Binarization (double-well) penalty weight.  Mutable so callers can
+        # anneal it across outer iterations (graduated binarization): keep it 0
+        # while the dark hole is dug, then ramp up.  The effective scale tracks
+        # this weight via the binarize_scale property and is normalized the same
+        # way as throughput, so the two objectives trade off on an O(1) scale.
+        self.binarize_weight = float(binarize_weight)
+        if binarize_kind not in ("quadratic", "tent"):
+            raise ValueError(
+                f"binarize_kind must be 'quadratic' or 'tent', got {binarize_kind!r}"
+            )
+        self.binarize_kind = binarize_kind
+        self._normalize_throughput = bool(normalize_throughput)
         self.optimizer_kwargs = (
             {} if optimizer_kwargs is None else dict(optimizer_kwargs)
         )
@@ -679,6 +834,14 @@ class AugmentedLagrangian:
         # Restore the coronagraph state to the actual apodizer (forward above
         # ran with include_fpm=False purely to measure the direct peak).
         self._push(self.x)
+
+    @property
+    def binarize_scale(self):
+        """Effective binarization weight (normalized like throughput)."""
+        scale = self.binarize_weight
+        if self._normalize_throughput:
+            scale /= self.n_params
+        return scale
 
     def _as_bound(self, value, default):
         """Return a length-``n_params`` bound vector."""
@@ -749,25 +912,49 @@ class AugmentedLagrangian:
         f = -self.throughput_scale * np.sum(x)
         g = np.full(self.n_params, -self.throughput_scale, dtype=float)
 
+        # Binarization penalty: drives pixels toward the bounds for a near-binary
+        # apodizer.  Concave (it un-convexifies the objective), so anneal beta up
+        # from 0 once the dark hole is feasible rather than enabling it early.
+        beta = self.binarize_scale
+        if beta:
+            l, u = self.lower_bounds, self.upper_bounds
+            if self.binarize_kind == "tent":
+                # Distance to nearest bound: beta * sum(min(x - l, u - x)).
+                # Constant force toward the nearest bound everywhere (gradient
+                # +-beta), including at mid-gray -- where the quadratic well's
+                # force vanishes -- so it crystallizes stuck mid-gray pixels.
+                f += float(beta * np.sum(np.minimum(x - l, u - x)))
+                g += beta * np.sign(0.5 * (l + u) - x)
+            else:
+                # Quadratic double well: beta * sum((x - l)(u - x)).  Smooth, but
+                # its force beta * (l + u - 2x) vanishes at mid-gray, so mid-gray
+                # pixels barely move no matter how large beta is.
+                f += float(beta * np.sum((x - l) * (u - x)))
+                g += beta * (l + u - 2 * x)
+
         for iw, wvl in enumerate(self.wvl):
             E_focal = self.coro.forward(wvl, include_fpm=self.include_fpm)
             E_dh = E_focal.ravel()[self._dh_idx]
             norm = self._normalization[iw]
-            intensity = (E_dh.real * E_dh.real + E_dh.imag * E_dh.imag) / norm
-            constraints = intensity - self.contrast[iw]
+            contrast = self.contrast[iw]
 
+            # The constraint object supplies the residual c (<= 0 feasible) and
+            # the field-gradient seed; the AL penalty machinery below is identical
+            # whether c bounds intensity, |Re a|/|Im a|, or any custom quantity.
+            c = self.constraint.residual(E_dh, norm, contrast)
             lam = self.multipliers[iw]
-            shifted = lam + self.penalty * constraints
-            positive = np.maximum(shifted, 0)
+            positive = np.maximum(lam + self.penalty * c, 0)
             f += float(
                 (np.sum(positive * positive) - np.sum(lam * lam)) / (2 * self.penalty)
             )
 
             if np.any(positive > 0):
-                # Seed carries the 1/norm from c = intensity/norm - contrast:
-                # dJ/dE* = (dP/dc)(dc/dI)(dI/dE*) = positive * (1/norm) * E.
+                # d(penalty)/dc = positive, so the focal-plane seed is
+                # dJ/dE* = positive * dc/dE*, assembled by the constraint object.
                 Ebar = self._zeroed_Ebar(E_focal)
-                Ebar.ravel()[self._dh_idx] = (positive / norm) * E_dh
+                Ebar.ravel()[self._dh_idx] = self.constraint.grad_seed(
+                    E_dh, norm, contrast, positive
+                )
                 self.coro.reverse(Ebar, wvl, include_fpm=self.include_fpm)
                 adj = self.coro.adjoint_at_entrance_pupil.ravel()[self._pupil_idx]
                 g += 2 * np.real(adj)
@@ -775,17 +962,23 @@ class AugmentedLagrangian:
         return f, g
 
     def constraint_values(self, x=None):
-        """Return ``intensity - contrast`` for every wavelength/dark-hole pixel."""
+        """Return the inequality constraint values (``<= 0`` is feasible).
+
+        Intensity: ``intensity/norm - contrast`` per pixel, shape
+        ``(n_wvl, n)``.  Field: the ``|Re a| - s`` and ``|Im a| - s`` constraints
+        on the normalized amplitude, shape ``(n_wvl, 2, n)``.
+        """
         if x is not None:
             self._push(x)
 
-        constraints = np.empty_like(self.contrast)
+        constraints = np.empty(self._mult_shape, dtype=float)
         for iw, wvl in enumerate(self.wvl):
             E_dh = self.coro.forward(wvl, include_fpm=self.include_fpm).ravel()[
                 self._dh_idx
             ]
-            intensity = E_dh.real * E_dh.real + E_dh.imag * E_dh.imag
-            constraints[iw] = intensity / self._normalization[iw] - self.contrast[iw]
+            constraints[iw] = self.constraint.residual(
+                E_dh, self._normalization[iw], self.contrast[iw]
+            )
         return constraints
 
     def violation(self, constraints=None):
@@ -822,7 +1015,9 @@ class AugmentedLagrangian:
         # Reconstruct the full 2-D amplitude map (zeros outside the pupil).
         shape = self.pupil.data.shape
         img = np.zeros(shape, dtype=float)
-        img.flat[self._pupil_idx] = x
+        # reshape(-1) (a view on the contiguous array) rather than .flat:
+        # cupy's flat iterator does not support fancy indexing.
+        img.reshape(-1)[self._pupil_idx] = x
 
         # Apply isotropic Gaussian blur.  Values stay in [0, 1] because the
         # kernel is normalized and inputs are non-negative, so boundary pixels
@@ -831,7 +1026,7 @@ class AugmentedLagrangian:
         blurred = ndimage.gaussian_filter(img, sigma=self.relaxation_sigma)
 
         # Extract active-pixel values from the blurred image.
-        x_smooth = blurred.flat[self._pupil_idx].copy()
+        x_smooth = blurred.reshape(-1)[self._pupil_idx].copy()
 
         # Re-scale to preserve the total active-pixel transmission (energy).
         # Boundary bleed reduces the in-pupil sum slightly; undo that effect.
@@ -851,6 +1046,28 @@ class AugmentedLagrangian:
         kwargs.setdefault("lower_bounds", self.lower_bounds)
         kwargs.setdefault("upper_bounds", self.upper_bounds)
         return self.optimizer(self.fg, x0.copy(), **kwargs)
+
+    def _make_governor(self):
+        """Build a fresh stop-condition governor for one inner solve.
+
+        Returns ``None`` when no stop conditions are configured (the inner
+        loop then runs the full ``inner_steps`` budget unless the optimizer
+        self-terminates).  Rebuilt every inner solve because tolerance
+        governors carry per-solve state (e.g. ``FunctionTolerance``'s previous
+        objective value) and the AL objective changes between outer iterations
+        as the multipliers and penalty update, so f/g histories are not
+        comparable across solves.
+        """
+        if self._governor_factory is not None:
+            return self._governor_factory()
+        conditions = []
+        if self.ftol is not None:
+            conditions.append(FunctionTolerance(self.ftol))
+        if self.gtol is not None:
+            conditions.append(GradientTolerance(self.gtol))
+        if not conditions:
+            return None
+        return AnyGovernor(conditions)
 
     def step(self, inner_steps=50, apply_relaxation=True, progress=False):
         """Run one augmented-Lagrangian outer iteration.
@@ -879,6 +1096,7 @@ class AugmentedLagrangian:
             Diagnostics for the completed outer iteration.
         """
         inner = self._make_inner_optimizer(self._x_start)
+        governor = self._make_governor()
         inner_iters = 0
         inner_status = "max_inner_steps"
 
@@ -894,13 +1112,31 @@ class AugmentedLagrangian:
 
         for _ in range(inner_steps):
             try:
-                inner.step()
+                # PrysmLBFGSB.step() returns (x_pre, f, g) evaluated at the
+                # pre-step iterate; inner.x is the post-step iterate.
+                x_pre, f_pre, g_pre = inner.step()
                 inner_iters += 1
             except StopIteration:
-                inner_status = "stopped"
+                inner_status = "optimizer_stopped"
                 break
             if pbar is not None:
                 pbar.update(1)
+
+            # Governor-based early exit (function/gradient tolerance, etc.).
+            if governor is not None:
+                record = StepRecord(
+                    optimizer=inner,
+                    iteration=inner_iters,
+                    x=x_pre,
+                    f=f_pre,
+                    g=g_pre,
+                    x_next=inner.x,
+                    metadata=getattr(inner, "last_step_metadata", None),
+                )
+                decision = governor.observe(record)
+                if decision.stop:
+                    inner_status = decision.message or "governor_stop"
+                    break
 
         if pbar is not None:
             pbar.close()
@@ -922,12 +1158,12 @@ class AugmentedLagrangian:
         max_violation = self.update_multipliers(constraints)
 
         penalty_before = self.penalty
-        if (
-            self.last_violation is not None
-            and max_violation > self.constraint_tolerance
-            and max_violation > self.constraint_reduction * self.last_violation
-        ):
-            self.penalty *= self.penalty_growth
+        # if (
+        #     self.last_violation is not None
+        #     and max_violation > self.constraint_tolerance
+        #     and max_violation > self.constraint_reduction * self.last_violation
+        # ):
+        self.penalty *= self.penalty_growth
 
         # Progressive relaxation: blur the apodizer to perturb the *next* inner
         # solve out of local minima.  Only the starting point for the next solve

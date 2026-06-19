@@ -1,5 +1,6 @@
 # data folders
 al_progress/
+*.gif
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
