@@ -199,7 +199,7 @@ def test_augmented_lagrangian_runs_multiple_outer_iterations_on_segmented_pupil(
         outer_radius=circumscribed_diameter * 0.95 / 2,
     )
     
-    set_backend_to_cupy()
+    #set_backend_to_cupy()
     coro = Coronagraph(pupil=pupil, fpm=fpm, lyot_stop=lyot_stop, executor=executor)
 
     x0 = pupil.data[pupil.mask].astype(float).copy()
@@ -398,7 +398,7 @@ def test_joint_mse_throughput_binary():
         outer_radius=circumscribed_diameter * 0.95 / 2,
     )
 
-    set_backend_to_cupy()
+    #set_backend_to_cupy()
     coro = Coronagraph(pupil=pupil, fpm=fpm, lyot_stop=lyot_stop, executor=executor)
 
     wvls = [0.95 * wvl, wvl, 1.05 * wvl]
