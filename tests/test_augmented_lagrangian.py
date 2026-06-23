@@ -359,16 +359,37 @@ def test_joint_mse_throughput_binary():
     # dark-hole-feasible solutions -- sweep mu around this value to trade
     # contrast vs throughput/binarity.
     alpha_mse = 1.0
-    mu = 9e-11
+    mu = 1e-5
 
     # Outer/inner budget.  Each outer iteration runs an inner PrysmLBFGSB solve
     # of the weighted-sum objective; between solves the converged apodizer is
     # blurred (progressive relaxation, Por 2022) to perturb the next solve's
     # start out of local minima.  The blur kernel is cooled over the outer loop.
-    n_outer = 1
-    n_inner = 500
+    n_outer = 3
+    n_inner = 25_000
     sigma0, sigma_min = 4.0, 0.5      # relaxation kernel std (px), cooled
 
+
+    pupil = VariablePupil.hexagonal_segmented(
+        Dpup=circumscribed_diameter,
+        Npup=npup,
+        rings=n_rings,
+        segment_diameter=flat_to_flat,
+        segment_separation=gap_size,
+        exclude=exclude,
+        mode="amplitude",
+    )
+    
+    set_backend_to_cupy()
+    pupil.data = np.asarray(pupil.data)
+    fpm = FPM.annular(nfoc, lamD, px_per_lamD, inner_radius=3, outer_radius=12)
+    lyot_stop = Pupil.annular(
+        Dpup=circumscribed_diameter,
+        Npup=npup,
+        inner_radius=circumscribed_diameter * 0.00 / 2,
+        outer_radius=circumscribed_diameter * 0.95 / 2,
+    )
+    
     executor = prepare_executor(
         pupil_dx=circumscribed_diameter / npup,
         pupil_samples=npup,
@@ -380,25 +401,6 @@ def test_joint_mse_throughput_binary():
         kind="mdft",
     )
 
-    pupil = VariablePupil.hexagonal_segmented(
-        Dpup=circumscribed_diameter,
-        Npup=npup,
-        rings=n_rings,
-        segment_diameter=flat_to_flat,
-        segment_separation=gap_size,
-        exclude=exclude,
-        mode="amplitude",
-    )
-
-    fpm = FPM.annular(nfoc, lamD, px_per_lamD, inner_radius=3, outer_radius=12)
-    lyot_stop = Pupil.annular(
-        Dpup=circumscribed_diameter,
-        Npup=npup,
-        inner_radius=circumscribed_diameter * 0.00 / 2,
-        outer_radius=circumscribed_diameter * 0.95 / 2,
-    )
-
-    #set_backend_to_cupy()
     coro = Coronagraph(pupil=pupil, fpm=fpm, lyot_stop=lyot_stop, executor=executor)
 
     wvls = [0.95 * wvl, wvl, 1.05 * wvl]

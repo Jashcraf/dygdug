@@ -6,12 +6,13 @@ from prysm.propagation import focus_dft, focus_dft_backprop
 from prysm.x.optym.cost import bias_and_gain_invariant_error
 from prysm.x.polarization import linear_polarizer, quarter_wave_plate
 
-from .poi_math import broadcast_kron
-from .processing import mean_squared_error
 from .propagation import _angular_spectrum_prop, _angular_spectrum_transfer_function
 
 U = np.array([[1, 0, 0, 1], [1, 0, 0, -1], [0, 1, 1, 0], [0, 1j, -1j, 0]])
 
+
+def mean_squared_error(I, D):
+    return np.mean((I, D) ** 2)
 
 class ADPhaseRetireval:
     def __init__(
@@ -165,7 +166,7 @@ class PZPhaseRetrieval:
 
         TODO: Add support for non-ideal polarization elements
 
-        This is very much _in progress_, and does not work with the modern prysm API
+        This is very much *in progress*, and does not work with the modern prysm API
 
         Parameters
         ----------

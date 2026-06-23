@@ -1,0 +1,21 @@
+name: rtd3
+channels:
+  - conda-forge
+dependencies:
+  - python=3.14
+  - numpy
+  - scipy
+  - matplotlib
+  - graphviz
+  - tqdm
+  - sphinx
+  - pydata-sphinx-theme
+  - scikit-image
+  - imageio
+  - jupyterlab
+  - pandoc
+  - pip
+  - pip:
+      - nbsphinx
+      - nbconvert
+      - ipykernel
