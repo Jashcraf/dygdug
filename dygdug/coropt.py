@@ -416,7 +416,7 @@ class CoronagraphOptimizer:
         self._push(x)
 
         # Accumulates cost and gradient over all wavelengths
-        J = 0.0
+        self.J = 0.0
         grad = np.zeros(self.n_params)
 
         for wvl in self.wvl:
@@ -427,13 +427,13 @@ class CoronagraphOptimizer:
             if self.cost_domain == "field":
                 # Field-domain cost: forward/reverse consume the complex field
                 # directly and reverse returns the Wirtinger seed dJ/dE*.
-                J += float(self.cost_fn.forward(E_dh))
+                self.J += float(self.cost_fn.forward(E_dh))
                 Ebar[self.dh] = self.cost_fn.reverse(E_dh)
             else:
                 # Intensity-domain cost on the dark-hole intensity I = |E|^2.
                 # Wirtinger gradient at focal plane: dJ/dE* = (dJ/dI) · E.
                 I_dh = np.abs(E_dh) ** 2
-                J += float(self.cost_fn.forward(I_dh))
+                self.J += float(self.cost_fn.forward(I_dh))
                 Ebar[self.dh] = self.cost_fn.reverse(I_dh) * E_dh
 
             # Back-propagate gradient to pupil plane (return value is 2D;
@@ -453,7 +453,7 @@ class CoronagraphOptimizer:
             if isinstance(elem, VariableLyotStop):
                 grad[sl] = self._fd_grad(x, sl)
 
-        return J, grad
+        return self.J, grad
 
     # ------------------------------------------------------------------
     # Gradient helpers
