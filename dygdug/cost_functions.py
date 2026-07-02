@@ -347,3 +347,33 @@ class FieldBoxConstraint:
         im = E_dh.imag * rn
         pos_re, pos_im = positive[0], positive[1]
         return 0.5 * rn * (pos_re * np.sign(re) + 1j * pos_im * np.sign(im))
+
+
+class ScaledFieldBoxConstraint(FieldBoxConstraint):
+    """:class:`FieldBoxConstraint` with residuals normalized to O(1).
+
+    The raw field-box residual ``|Re a| - s`` lives on the scale of
+    ``s = sqrt(contrast / 2)`` -- ~7e-6 for a 1e-10 contrast target -- which is
+    invisible next to an O(1) throughput objective until the AL penalty ``rho``
+    grows enormous, wrecking the conditioning of both the inner solves and the
+    multiplier update ``lambda <- max(0, lambda + rho*c)``.
+
+    This subclass divides the residual by ``s``, i.e. ``c = |Re a|/s - 1``
+    (and likewise for the imaginary part), so feasible residuals lie in
+    ``[-1, 0]`` and violations are *fractional* amplitude violations.  The
+    feasible set is identical to :class:`FieldBoxConstraint`; only the scaling
+    of the residuals -- and therefore of ``rho``, the multipliers, and reported
+    violations -- changes, keeping all of them O(1).
+    """
+
+    domain = "field"
+
+    def residual(self, E_dh, norm, contrast):
+        s = np.sqrt(contrast / 2)
+        return super().residual(E_dh, norm, contrast) / s
+
+    def grad_seed(self, E_dh, norm, contrast, positive):
+        # c_scaled = c_raw / s, so dc_scaled/dE* = (dc_raw/dE*) / s.  Fold the
+        # 1/s into the activated multipliers, which multiply dc/dE* linearly.
+        s = np.sqrt(contrast / 2)
+        return super().grad_seed(E_dh, norm, contrast, positive / s)
