@@ -188,7 +188,7 @@ class FPM:
         return cls(caller_number_1, dx)
 
     @classmethod
-    def annular(cls, N, lamD, px_per_lamD, inner_radius, outer_radius):
+    def annular(cls, N, lamD, px_per_lamD, inner_radius, outer_radius, theta_min=-90, theta_max=90):
         """Create an annular focal plane mask.
 
         AI Disclosure: written by Claude Haiku 4.5
@@ -205,6 +205,10 @@ class FPM:
             Inner radius of annulus in lambda/D
         outer_radius : float
             Outer radius of annulus in lambda/D
+        theta_min : float, optional
+            Minimum angle of the wedge in degrees (default is -90)
+        theta_max : float, optional
+            Maximum angle of the wedge in degrees (default is 90)
 
         Returns
         -------
@@ -216,15 +220,12 @@ class FPM:
         x, y = coordinates.make_xy_grid(N, dx=dx)
         r = np.hypot(x, y)
 
-        # Convert radii from lambda/D to physical units
-        inner_r = inner_radius * lamD
-        outer_r = outer_radius * lamD
+        # use ImgSamplingSpec to store the parameters for the annular mask
+        iss = ImgSamplingSpec(N, lamD, px_per_lamD)
 
         def fpmfunc(wvl):
-            # Create mask: 1 inside the annulus, 0 outside
-            inner_circle = geometry.circle(inner_r, r)
-            outer_circle = geometry.circle(outer_r, r)
-            return outer_circle * (1 - inner_circle)
+            mask = annular_mask(iss, inner_radius, outer_radius, theta_min=theta_min, theta_max=theta_max)
+            return mask.astype(float)
 
         caller_number_2 = WavelengthDependentFunctionCache(fpmfunc)
         return cls(caller_number_2, dx)
