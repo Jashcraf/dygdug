@@ -14,6 +14,7 @@ from dygdug.cost_functions import (
     FieldBoxConstraint,
     IntensityConstraint,
     MeanSquaredErrorQuadratic,
+    ScaledFieldBoxConstraint,
 )
 from dygdug.masks import FPM, Pupil
 
@@ -569,6 +570,7 @@ class AugmentedLagrangian:
         normalize_throughput=False,
         binarize_weight=0.0,
         binarize_kind="quadratic",
+        binarize_smoothing=0.0,
         constraint_kind="intensity",
         constraint=None,
         multipliers=None,
@@ -629,7 +631,18 @@ class AugmentedLagrangian:
             ``min(x - l, u - x)``, which applies constant force ``+-beta``
             toward the nearest bound everywhere (including mid-gray), so it
             binarizes stuck mid-gray pixels far more aggressively.
-        constraint_kind : {'intensity', 'field'}, optional
+        binarize_smoothing : float, optional
+            Half-width (in amplitude units) of a Huber smoothing of the tent
+            penalty's mid-gray kink; only used with ``binarize_kind='tent'``.
+            The raw tent gradient is discontinuous at mid-gray, which breaks
+            smooth quasi-Newton inner solvers -- ``PrysmLBFGSB``'s strong-Wolfe
+            line search fails and the inner solve exits after ~1 iteration.
+            With smoothing ``delta > 0`` the penalty is quadratic within
+            ``delta`` of mid-gray and identical to the tent (constant force)
+            outside it, making the objective C^1 so the line search survives.
+            Default 0 (exact tent).  A few percent of the bound span (e.g.
+            0.05) is a good choice.
+        constraint_kind : {'intensity', 'field', 'scaled-field'}, optional
             Convenience selector for a built-in dark-hole constraint, used only
             when ``constraint`` is None.  ``'intensity'`` (default) bounds
             ``|E|^2 / norm <= contrast`` -- a convex quadratic whose optimum lies
@@ -640,8 +653,14 @@ class AugmentedLagrangian:
             maximization drives a binary apodizer.  ``contrast`` keeps the same
             meaning (max intensity relative to the direct peak) in both modes.
             In field mode the multipliers have shape ``(n_wvl, 2, n)`` (axis 1
-            indexes real/imag).  Maps to :class:`IntensityConstraint` /
-            :class:`FieldBoxConstraint` respectively.
+            indexes real/imag).  ``'scaled-field'`` is the same feasible set as
+            ``'field'`` with the residuals divided by ``s`` so they are O(1):
+            strongly preferred in practice, because the raw field residuals
+            live on the ~``s`` (e.g. 7e-6) scale and force the penalty ``rho``
+            to grow enormous before the constraint competes with the O(1)
+            throughput objective.  Maps to :class:`IntensityConstraint` /
+            :class:`FieldBoxConstraint` / :class:`ScaledFieldBoxConstraint`
+            respectively.
         constraint : constraint object or class, optional
             Pluggable dark-hole constraint that *replaces* ``constraint_kind``
             when given.  Must follow the constraint protocol in
@@ -744,16 +763,17 @@ class AugmentedLagrangian:
         # field-gradient seed, and the multiplier shape, so ``fg`` and
         # ``constraint_values`` stay agnostic to intensity vs. field.
         if constraint is None:
-            if constraint_kind not in ("intensity", "field"):
+            builtin_constraints = {
+                "intensity": IntensityConstraint,
+                "field": FieldBoxConstraint,
+                "scaled-field": ScaledFieldBoxConstraint,
+            }
+            if constraint_kind not in builtin_constraints:
                 raise ValueError(
-                    f"constraint_kind must be 'intensity' or 'field', got "
-                    f"{constraint_kind!r}"
+                    f"constraint_kind must be one of {sorted(builtin_constraints)}, "
+                    f"got {constraint_kind!r}"
                 )
-            self.constraint = (
-                FieldBoxConstraint()
-                if constraint_kind == "field"
-                else IntensityConstraint()
-            )
+            self.constraint = builtin_constraints[constraint_kind]()
         else:
             self.constraint = constraint() if isinstance(constraint, type) else constraint
         self.constraint_kind = constraint_kind
@@ -797,6 +817,7 @@ class AugmentedLagrangian:
                 f"binarize_kind must be 'quadratic' or 'tent', got {binarize_kind!r}"
             )
         self.binarize_kind = binarize_kind
+        self.binarize_smoothing = float(binarize_smoothing)
         self._normalize_throughput = bool(normalize_throughput)
         self.optimizer_kwargs = (
             {} if optimizer_kwargs is None else dict(optimizer_kwargs)
@@ -919,12 +940,32 @@ class AugmentedLagrangian:
         if beta:
             l, u = self.lower_bounds, self.upper_bounds
             if self.binarize_kind == "tent":
-                # Distance to nearest bound: beta * sum(min(x - l, u - x)).
-                # Constant force toward the nearest bound everywhere (gradient
-                # +-beta), including at mid-gray -- where the quadratic well's
-                # force vanishes -- so it crystallizes stuck mid-gray pixels.
-                f += float(beta * np.sum(np.minimum(x - l, u - x)))
-                g += beta * np.sign(0.5 * (l + u) - x)
+                # Distance to nearest bound: beta * sum(min(x - l, u - x)),
+                # equivalently beta * sum(half - |d|) with d = x - mid and
+                # half = (u - l)/2.  Constant force toward the nearest bound
+                # everywhere (gradient +-beta), including at mid-gray -- where
+                # the quadratic well's force vanishes -- so it crystallizes
+                # stuck mid-gray pixels.
+                d = x - 0.5 * (l + u)
+                half = 0.5 * (u - l)
+                delta = self.binarize_smoothing
+                if delta > 0:
+                    # Huberize the mid-gray kink: quadratic within delta of
+                    # mid-gray, exact tent (constant force) outside.  The raw
+                    # tent's sign() gradient is discontinuous there, which
+                    # makes strong-Wolfe line searches (PrysmLBFGSB) fail and
+                    # kills the inner solve after ~1 iteration.
+                    ad = np.abs(d)
+                    quad = ad <= delta
+                    f_pix = half - np.where(quad, d * d / (2 * delta) + delta / 2, ad)
+                    # Pinned pixels (l == u, so half == 0) would contribute a
+                    # constant -delta/2; zero them so the reported objective
+                    # stays meaningful during fix-and-release rounding.
+                    f += float(beta * np.sum(np.where(half > 0, f_pix, 0.0)))
+                    g += beta * np.where(quad, -d / delta, -np.sign(d))
+                else:
+                    f += float(beta * np.sum(half - np.abs(d)))
+                    g += beta * -np.sign(d)
             else:
                 # Quadratic double well: beta * sum((x - l)(u - x)).  Smooth, but
                 # its force beta * (l + u - 2x) vanishes at mid-gray, so mid-gray
@@ -1069,6 +1110,69 @@ class AugmentedLagrangian:
             return None
         return AnyGovernor(conditions)
 
+    def pin(self, threshold=0.05):
+        """Pin decided pixels to their nearest bound (fix-and-release rounding).
+
+        Enforcing contrast on a continuous design and hard-thresholding at the
+        end perturbs the dark-hole field with no feedback, so the binary design
+        can violate the contrast target.  Progressive fix-and-release rounding
+        avoids that: alternately *pin* the pixels that have already decided
+        (within ``threshold`` of a bound) by collapsing their box to that bound,
+        then run more :meth:`step` calls so the remaining free pixels restore
+        feasibility around the pinned ones.  Repeating with a loosening
+        threshold until no free pixels remain yields a design that is binary
+        *by construction* and whose contrast constraint was enforced by the AL
+        on the actual pinned design -- no post-hoc threshold step.
+
+        A free pixel is pinned to its lower bound when
+        ``x - l <= threshold * (u - l)`` (and to its upper bound likewise);
+        with ``threshold=0.5`` every remaining free pixel is pinned to its
+        nearest bound.  Already-pinned pixels (``l == u``) are left alone, so
+        the method is idempotent and safe to call between outer steps.  The
+        current solution ``x`` and the next inner solve's starting point are
+        snapped onto the updated bounds.
+
+        Parameters
+        ----------
+        threshold : float, optional
+            Fraction of the per-pixel bound span within which a pixel is
+            considered decided.  Values above 0.5 behave like 0.5 (nearest
+            bound).
+
+        Returns
+        -------
+        info : dict
+            ``n_pinned`` (newly pinned by this call), ``n_pinned_total``
+            (all pixels with ``l == u``), and ``n_free`` (still optimizable).
+        """
+        l, u = self.lower_bounds, self.upper_bounds
+        x = self.x
+        span = u - l
+        free = span > 0
+        margin = threshold * span
+        # Ties (x exactly mid-span with threshold >= 0.5) pin low.
+        pin_low = free & (x - l <= margin) & (x - l <= u - x)
+        pin_high = free & (u - x <= margin) & ~pin_low
+
+        u[pin_low] = l[pin_low]
+        l[pin_high] = u[pin_high]
+
+        # Snap the solution and the next start onto the collapsed bounds; clip
+        # everything into the (possibly relaxed/blurred) box to stay feasible.
+        for vec in (self.x, self._x_start):
+            vec[pin_low] = l[pin_low]
+            vec[pin_high] = u[pin_high]
+            np.clip(vec, l, u, out=vec)
+        self._push(self.x)
+
+        n_pinned = int(np.count_nonzero(pin_low) + np.count_nonzero(pin_high))
+        n_pinned_total = int(np.count_nonzero(u == l))
+        return {
+            "n_pinned": n_pinned,
+            "n_pinned_total": n_pinned_total,
+            "n_free": self.n_params - n_pinned_total,
+        }
+
     def step(self, inner_steps=50, apply_relaxation=True, progress=False):
         """Run one augmented-Lagrangian outer iteration.
 
@@ -1158,12 +1262,19 @@ class AugmentedLagrangian:
         max_violation = self.update_multipliers(constraints)
 
         penalty_before = self.penalty
-        # if (
-        #     self.last_violation is not None
-        #     and max_violation > self.constraint_tolerance
-        #     and max_violation > self.constraint_reduction * self.last_violation
-        # ):
-        self.penalty *= self.penalty_growth
+        # Grow the penalty only while the constraints are violated AND the
+        # violation is not already shrinking fast enough on its own (the
+        # standard AL update, e.g. Nocedal & Wright ch. 17).  Growing rho
+        # unconditionally compounds every outer step (2x/step for 60 steps is
+        # ~1e18) and destroys the conditioning of both the inner solves and
+        # the multiplier update.  On the first outer iteration there is no
+        # previous violation to compare against, so growth waits a step.
+        if (
+            self.last_violation is not None
+            and max_violation > self.constraint_tolerance
+            and max_violation > self.constraint_reduction * self.last_violation
+        ):
+            self.penalty *= self.penalty_growth
 
         # Progressive relaxation: blur the apodizer to perturb the *next* inner
         # solve out of local minima.  Only the starting point for the next solve
