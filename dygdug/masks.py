@@ -20,7 +20,17 @@ ImgSamplingSpec = namedtuple("ImageSamplingSpec", ["N", "lamD", "px_per_lamD"])
 
 
 class ImgSamplingSpec:
-    """Specification for image plane sampling."""
+    """Specification for image plane sampling.
+    
+    Parameters
+    ----------
+    N : int
+        Number of pixels per side of the square image
+    dx : float
+        Intersample spacing, physical units
+    lamD : float
+        Lambda/D scale, physical units
+    """
 
     def __init__(self, N, dx, lamD):
         self.N = N
@@ -221,7 +231,7 @@ class FPM:
         r = np.hypot(x, y)
 
         # use ImgSamplingSpec to store the parameters for the annular mask
-        iss = ImgSamplingSpec(N, lamD, px_per_lamD)
+        iss = ImgSamplingSpec.from_N_lamD_px_per_lamD(N, lamD, px_per_lamD)
 
         def fpmfunc(wvl):
             mask = annular_mask(iss, inner_radius, outer_radius, theta_min=theta_min, theta_max=theta_max)
