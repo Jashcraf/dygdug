@@ -1,4 +1,5 @@
 # dygdug
+[![DOI](https://zenodo.org/badge/608866457.svg)](https://doi.org/10.5281/zenodo.21711471)
 dygdug is an extension to prysm, containing a set of standard models for coronagraphs and the specialized wavefront sensing and control required for coronagraphy. The dygdug coronagraph optimization and phase retrieval routines are inherited from [poi](https://github.com/Jashcraf/poi), written by Jaren Ashcraft. Some tutorial notebooks were originally in the poi repository. The original structure of dygdug, as well as the prysm library were written by Brandon Dube.
 
 # Installation
