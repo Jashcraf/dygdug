@@ -3,6 +3,46 @@ from prysm.mathops import np
 from prysm.x.dm import DM
 
 
+class Imager:
+    def __init__(self, pupil, executor):
+        self.pupil = pupil
+        self.executor = executor
+
+    def forward(self):
+        """
+        Propagate the field forward through the imager.
+
+        Returns
+        -------
+        field_at_focal : ndarray
+            The complex field at the focal plane.
+        """
+
+        self.field_at_focal = propagation.focus_dft(
+            self.pupil.data,
+            executor=self.executor,
+        )
+
+        return self.field_at_focal
+    
+    def reverse(self):
+        """
+        Propagate the field backward through the imager.
+
+        Returns
+        -------
+        adjoint_field : ndarray
+            The complex field at the entrance pupil
+        """
+
+        self.adjoint_at_entrance_pupil = propagation.focus_dft_adjoint(
+            self.field_at_focal,
+            executor=self.executor,
+        )
+
+        return self.adjoint_at_entrance_pupil
+
+
 class Coronagraph:
     def __init__(self, pupil, fpm, lyot_stop, executor):
         self.pupil = pupil
