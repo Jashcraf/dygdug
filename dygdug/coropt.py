@@ -1,5 +1,7 @@
 """Coronagraph optimizer."""
 
+import numpy as onp
+
 from prysm import coordinates, geometry
 from prysm.mathops import ndimage, np
 from prysm.x.optym.governors import (
@@ -328,7 +330,16 @@ class CoronagraphOptimizer:
         Coronagraph model to optimise.
     wvl : float or sequence of float
         Wavelength(s) to include.  Cost and gradient are summed over all
-        wavelengths.
+        wavelengths.  Each wavelength's dark-hole quantity is normalized by
+        the peak of that wavelength's direct (no-FPM) PSF before it reaches
+        the cost function, so ``cost.target`` is a true contrast and the
+        short end of a band does not dominate the sum by the ``1/lambda^2``
+        scaling of the direct peak alone.
+    weights : sequence of float, optional
+        Per-wavelength *intensity* weights, normalized internally to sum to
+        one.  Defaults to the weights of a
+        :class:`~dygdug.models.PolychromaticExecutor` when *wvl* is that
+        bank's wavelength list, and to equal weights otherwise.
     cost : cost-function class or instance, optional
         Must expose ``.forward`` → scalar and ``.reverse`` → array.  The
         ``domain`` class attribute (see :mod:`dygdug.cost_functions`) selects
@@ -347,7 +358,8 @@ class CoronagraphOptimizer:
         Defaults to :class:`MeanSquaredErrorQuadratic`.
     """
 
-    def __init__(self, dark_hole, coro, wvl, cost=MeanSquaredErrorQuadratic):
+    def __init__(self, dark_hole, coro, wvl, weights=None,
+                 cost=MeanSquaredErrorQuadratic):
         # Accept 0/1 mask arrays, but always index with a boolean mask.
         # Integer masks would otherwise trigger NumPy advanced indexing.
         self.dh = np.asarray(dark_hole).astype(bool)
@@ -370,6 +382,49 @@ class CoronagraphOptimizer:
             raise ValueError(
                 f"cost domain must be 'intensity' or 'field', got {self.cost_domain!r}"
             )
+
+        # Spectral weights.  These are *intensity* weights -- the cost sums
+        # per-wavelength intensities, so a weight scales that wavelength's
+        # contribution directly.  (Note the contrast with the sqrt-photon
+        # E-field weights used by the broadband models in dygdug._models.)
+        # A PolychromaticExecutor's weights are adopted when this optimizer
+        # was handed that bank's wavelength list.
+        if weights is None:
+            bank_wvl = getattr(coro.executor, "wavelengths", None)
+            bank_w = getattr(coro.executor, "weights", None)
+            if (
+                bank_w is not None
+                and bank_wvl is not None
+                and len(bank_wvl) == len(self.wvl)
+                and bool(onp.allclose(bank_wvl, self.wvl))
+            ):
+                weights = bank_w
+            else:
+                weights = onp.ones(len(self.wvl))
+        weights = onp.asarray(weights, dtype=float).ravel()
+        if weights.size != len(self.wvl):
+            raise ValueError(
+                f"weights has length {weights.size}, expected {len(self.wvl)}"
+            )
+        if not bool(onp.all(weights >= 0)) or weights.sum() <= 0:
+            raise ValueError("weights must be non-negative with a positive sum")
+        # Normalized so a weighted cost stays comparable to a monochromatic one.
+        self.weights = weights / weights.sum()
+
+        # Per-wavelength contrast normalization: the peak of that wavelength's
+        # direct (no-FPM) PSF.  An executor bakes a 1/lambda into its norm, so
+        # the direct peak intensity scales as 1/lambda^2; without dividing it
+        # out, the blue end of a band would dominate the summed cost by that
+        # factor alone, and a cost ``target`` (an absolute contrast) would not
+        # mean the same thing at each wavelength.  Evaluated once from the
+        # pupil's current state -- over an optimization the direct peak tracks
+        # throughput at the ~10% level, negligible for cost scaling.
+        self._normalization = onp.empty(len(self.wvl))
+        for iw, wvl_ in enumerate(self.wvl):
+            E_direct = self.coro.forward(wvl_, include_fpm=False)
+            peak = float(np.max(E_direct.real * E_direct.real
+                                + E_direct.imag * E_direct.imag))
+            self._normalization[iw] = peak if peak > 0 else 1.0
 
         # --- Discover variable elements in pupil → fpm → lyot_stop order ---
         self._variable_elems = []  # [(attr_name, element), ...]
@@ -408,7 +463,8 @@ class CoronagraphOptimizer:
         Returns
         -------
         J : float
-            Scalar cost summed over all wavelengths.
+            Weighted sum over wavelengths of the cost evaluated on each
+            wavelength's normalized dark-hole quantity.
         grad : ndarray, shape ``(n_params,)``
             Gradient of *J* w.r.t. *x*.
         """
@@ -420,22 +476,32 @@ class CoronagraphOptimizer:
         self.J = 0.0
         grad = np.zeros(self.n_params)
 
-        for wvl in self.wvl:
+        for iw, wvl in enumerate(self.wvl):
+            weight = float(self.weights[iw])
+            norm = float(self._normalization[iw])
             E_focal = self.coro.forward(wvl, include_fpm=True)
             E_dh = E_focal[self.dh]
             Ebar = np.zeros_like(E_focal)
 
+            # The normalization scales what the cost *consumes*, not what it
+            # returns: a cost ``target`` is an absolute contrast, so feeding it
+            # raw intensity would compare a contrast against a photometric
+            # quantity.  The chain rule then carries the same factor into the
+            # gradient seed.
             if self.cost_domain == "field":
-                # Field-domain cost: forward/reverse consume the complex field
-                # directly and reverse returns the Wirtinger seed dJ/dE*.
-                self.J += float(self.cost_fn.forward(E_dh))
-                Ebar[self.dh] = self.cost_fn.reverse(E_dh)
+                # Field-domain cost consumes the normalized amplitude
+                # a = E / sqrt(norm) and returns the Wirtinger seed dJ/da*,
+                # so dJ/dE* = (dJ/da*) / sqrt(norm).
+                rn = 1.0 / np.sqrt(norm)
+                a_dh = E_dh * rn
+                self.J += weight * float(self.cost_fn.forward(a_dh))
+                Ebar[self.dh] = (weight * rn) * self.cost_fn.reverse(a_dh)
             else:
-                # Intensity-domain cost on the dark-hole intensity I = |E|^2.
-                # Wirtinger gradient at focal plane: dJ/dE* = (dJ/dI) · E.
-                I_dh = np.abs(E_dh) ** 2
-                self.J += float(self.cost_fn.forward(I_dh))
-                Ebar[self.dh] = self.cost_fn.reverse(I_dh) * E_dh
+                # Intensity-domain cost on normalized contrast I = |E|^2 / norm.
+                # Wirtinger gradient at focal plane: dJ/dE* = (dJ/dI) · E / norm.
+                I_dh = (np.abs(E_dh) ** 2) / norm
+                self.J += weight * float(self.cost_fn.forward(I_dh))
+                Ebar[self.dh] = (weight / norm) * self.cost_fn.reverse(I_dh) * E_dh
 
             # Back-propagate gradient to pupil plane (return value is 2D;
             # relevant slices are extracted below by the per-element helpers).
@@ -489,15 +555,22 @@ class CoronagraphOptimizer:
             return 2 * np.real(adj)
 
     def _total_cost(self, x):
-        """Forward-only cost evaluation used by the finite-difference helper."""
+        """Forward-only cost evaluation used by the finite-difference helper.
+
+        Applies the same weights and per-wavelength normalization as
+        :meth:`fg`; otherwise the finite-difference gradient would target a
+        different objective than the one ``fg`` reports.
+        """
         self._push(x)
         J = 0.0
-        for wvl in self.wvl:
+        for iw, wvl in enumerate(self.wvl):
+            weight = float(self.weights[iw])
+            norm = float(self._normalization[iw])
             E_dh = self.coro.forward(wvl, include_fpm=True)[self.dh]
             if self.cost_domain == "field":
-                J += float(self.cost_fn.forward(E_dh))
+                J += weight * float(self.cost_fn.forward(E_dh / np.sqrt(norm)))
             else:
-                J += float(self.cost_fn.forward(np.abs(E_dh) ** 2))
+                J += weight * float(self.cost_fn.forward((np.abs(E_dh) ** 2) / norm))
         return J
 
     def _fd_grad(self, x, sl, eps=1e-7):

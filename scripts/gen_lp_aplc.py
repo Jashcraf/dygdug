@@ -52,7 +52,9 @@ lyot = Pupil.annular(
 
 coro = Coronagraph(pupil=pupil, fpm=fpm, lyot_stop=lyot, executor=executor)
 
-iss = ImgSamplingSpec(Nfoc, px_per_lamD, lamD=lamD)
+# NB: ImgSamplingSpec's signature is (N, dx, lamD) -- passing px_per_lamD
+# positionally lands it in dx, which silently mis-scales the dark-hole grid.
+iss = ImgSamplingSpec.from_N_lamD_px_per_lamD(Nfoc, lamD, px_per_lamD)
 dark_hole = annular_mask(iss, iwa=3, owa=8, theta_min=-90, theta_max=90)
 dark_hole *= knife_edge_mask(iss, iwa=3)
 
@@ -65,6 +67,20 @@ contrast_req = 1e-10
 
 print(f"n = {n} pupil pixels, m = {m} dark-hole pixels -> 4m = {4*m} constraint rows")
 print(f"n / 4m = {n / (4*m):.1f}  (want >> 1)")
+print(f"A_ub {4 * m * n * 8 / 1e9:.1f} GB, normal equations {(4*m)**2 * 8 / 1e9:.1f} GB")
+
+# Fail fast rather than dying in an allocation after the Jacobian has been
+# built.  A_ub is 4m x n, and n is ~800k pupil pixels at Npup = 1024, so a
+# correctly scaled 3-8 lam/D dark hole does not fit in host memory at these
+# constants -- reduce Npup or px_per_lamD (dark-hole pixels scale as its
+# square) before running.
+MEMORY_BUDGET_GB = 8.0
+est_gb = (4 * m * n + (4 * m) ** 2) * 8 / 1e9
+if est_gb > MEMORY_BUDGET_GB:
+    raise SystemExit(
+        f"estimated {est_gb:.0f} GB > MEMORY_BUDGET_GB = {MEMORY_BUDGET_GB:.0f} GB; "
+        "reduce Npup or px_per_lamD, or narrow the working angles."
+    )
 
 t0 = perf_counter()
 A = np.empty((m, n), dtype=complex)

@@ -79,7 +79,32 @@ def sync_executor(executor):
     switched afterward, the matrices must be re-homed or they will be multiplied
     against arrays on the other device.  Re-homing is a no-op when they already
     match the active backend.  Returns *executor* for chaining.
+
+    Containers of operators are handled recursively.  Both
+    :class:`~dygdug.models.PolychromaticExecutor` (one operator per wavelength)
+    and prysm's ``MultiResolutionExecutor`` (one per resolution level) expose
+    their children as ``executors``; a container carries no ``Ex``/``Ey`` of its
+    own, so without the recursion this function would find nothing to do and
+    silently leave every matrix on the wrong device.
     """
+    if executor is None:
+        return executor
+
+    children = getattr(executor, "executors", None)
+    if children is not None:
+        for child in children:
+            sync_executor(child)
+        # A MultiResolutionExecutor also carries per-level partition-of-unity
+        # windows and focal coordinate grids; the windows multiply fields and
+        # the grids are handed to focal-plane-mask callables, both on the hot
+        # path.  (A PolychromaticExecutor has none of these — its wavelengths
+        # and weights are deliberately host-side scalars and stay put.)
+        for attr in ("windows", "xf", "yf"):
+            seq = getattr(executor, attr, None)
+            if seq is not None:
+                setattr(executor, attr, [asbackend(a) for a in seq])
+        return executor
+
     for attr in ("Ex", "Ey"):
         mat = getattr(executor, attr, None)
         if mat is not None:
@@ -104,7 +129,8 @@ def sync_coronagraph(coro, wavelengths=()):
     than on the ``forward``/``reverse`` hot path.  It re-homes every array the
     model touches repeatedly so the propagation stays entirely on one device:
 
-    * the executor's transform matrices (:func:`sync_executor`);
+    * the executor's transform matrices (:func:`sync_executor`, which recurses
+      into a polychromatic or multi-resolution bank of operators);
     * the pupil's ``data`` plus its ``mask`` / ``_mask_idx`` (so the scatter in
       :meth:`VariablePupil.update` and the adjoint gather stay on-device);
     * the Lyot stop's ``data`` and, for :class:`VariableLyotStop`, its ``_r``
