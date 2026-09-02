@@ -9,3 +9,4 @@ Task-oriented recipes for solving specific problems with dygdug.
    OptimizingCoronagraphs.ipynb
    APLC_Optimization.ipynb
    AdvancedOptimization.ipynb
+   OptimizingCoronagraphsLinearProgram.ipynb
