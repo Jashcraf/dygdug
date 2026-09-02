@@ -1,8 +1,7 @@
-import ipdb
 from prysm.coordinates import cart_to_polar, make_xy_grid
 from prysm.mathops import np
 from prysm.polynomials import hopkins
-from prysm.propagation import focus_dft, focus_dft_backprop
+from prysm.propagation import focus_dft, unfocus_dft 
 from prysm.x.optym.cost import bias_and_gain_invariant_error
 from prysm.x.polarization import linear_polarizer, quarter_wave_plate
 
@@ -11,8 +10,398 @@ from .propagation import _angular_spectrum_prop, _angular_spectrum_transfer_func
 U = np.array([[1, 0, 0, 1], [1, 0, 0, -1], [0, 1, 1, 0], [0, 1j, -1j, 0]])
 
 
-def mean_squared_error(I, D):
-    return np.mean((I, D) ** 2)
+def mean_squared_error(I, D, norm=None):
+    err = np.mean((I - D) ** 2)
+    if norm is not None:
+        err = err / norm
+    return err
+
+
+class IterativeTransformPhaseRetrieval:
+    def __init__(
+            self,
+            amp: np.ndarray,
+            wvl: float,
+            executor: "prysm.fttools.executor",
+            data: np.ndarray,
+            initial_phase: np.ndarray | None = None,
+    ) -> None:
+        """Base class for iterative-transform phase retrieval algorithms,
+        based on the Phase Retrieval tutorials by Brandon Dube, and the praise repository.
+
+        Parameters
+        ----------
+        amp : np.ndarray
+            Pupil amplitude, with sampling matching that specified by the 
+            supplied `executor` 
+        wvl : float
+            wavelength of light to use 
+        executor : prysm.fttools.executor
+            Executor that defines the propagation, including MFT, CZT, or FFTDFT 
+        data : np.ndarray
+            The PSF to fit to, must be the same size as out = focus_dft(amp, executor) 
+        initial_phase : np.ndarray or None, optional
+            optional phase starting guess, by default None
+
+        References
+        ---------- 
+        https://www.retrorefractions.com/blog/phase-retrieval-01/
+        https://www.retrorefractions.com/blog/phase-retrieval-02/
+        https://www.retrorefractions.com/blog/phase-retrieval-03/
+        https://www.retrorefractions.com/blog/phase-retrieval-04/
+        https://www.retrorefractions.com/blog/phase-retrieval-05/
+        """
+        if initial_phase is None:
+            initial_phase = np.random.rand(*amp.shape)
+
+        self.wvl = wvl
+        self.executor = executor
+        self.phase_guess = initial_phase
+        self.absF = np.sqrt(data)
+        self.absg = amp
+        self.g = self.absg * np.exp(1j * self.phase_guess)
+        self.mse_denom = np.sum(self.absF ** 2)
+        self.iter = 0
+        self.cost = []
+
+    def step(self):
+        """Advances the algorithm one iteration, not generally used by
+        this class, but rather by the derived classes that implement specific algorithms
+        """
+        pass
+
+
+class FocusDiversePhaseRetrieval:
+    """Focus Diversity Phase Retrieval using iterative-transform iteration.
+    Largely taken from the praise repository and associated Phase retrieval demos
+    by Brandon Dube
+
+    Algorithm inspired by Misel's two-psf algorithm [1], generalized to N psfs
+    - [1] D L Misell 1973 J. Phys. D: Appl. Phys. 6 2200
+    """
+
+    def __init__(self, psflist, wvl, dxs, defocus_positions, phase_guess=None):
+        """Phase Retrieval Iterator using Focus Diversity for N defocus positions
+
+        Parameters
+        ----------
+        psflist : list of numpy.ndarrays of the same shape
+            length N list of numpy.ndarrays that contain the defocused PSF data. Must be of the same pixel scale
+            and array size
+        wvl : float
+            wavelength of light in microns
+        dxs : float
+            pixel scale of the arrays in psflist in microns
+        defocus_positions : list of floats
+            defocus positions in microns
+        phase_guess : numpy.ndarray, optional
+            phase guess of the desired pupil sampling, by default None
+        """
+
+        # catch some common mistakes
+        assert len(defocus_positions) == len(dxs), (
+            f"defocus_positions and dxs should have the same length, got {len(defocus_positions)} and {len(dxs)}"
+        )
+        assert (len(psflist) == len(dxs) + 1) and (
+            len(psflist) == len(defocus_positions) + 1
+        ), (
+            f"psflist should be one element longer than dxs and defocus_positions, got {len(psflist)}"
+        )
+
+        if phase_guess is None:
+            phase_guess = np.random.rand(*psflist[0].shape)
+
+        self.absFlist = []
+        self.mse_denom = []
+
+        # TODO: Throw a try-except
+
+        # Create the object domain data in field units
+        for psf in psflist:
+            self.absFlist.append(np.fft.ifftshift(np.sqrt(psf)))
+            self.mse_denom.append(np.sum(psf))
+
+        # Begin with a guess using the first PSF
+        phase_guess = np.fft.ifftshift(phase_guess)
+        self.G0 = self.absFlist[0] * np.exp(1j * phase_guess)
+
+        # pre-compute transfer functions, lists of kernels
+        self.forward_prop = []
+        self.backward_prop = []
+        self.cost_functions = []  # will be a list of lists
+        for dz, dx in zip(defocus_positions, dxs):
+            self.forward_prop.append(
+                _angular_spectrum_transfer_function(psflist[0].shape, wvl, dx, dz)
+            )  # there was a 1e-3 factor here
+            self.backward_prop.append(
+                _angular_spectrum_transfer_function(psflist[0].shape, wvl, dx, -dz)
+            )
+            self.cost_functions.append([])
+
+        self.iter = 0
+
+
+    def step(self):
+        """use Misel's algorithm to perform an iteration between image space and the fourier plane
+
+        Returns
+        -------
+        G0primeprime
+            updated estimate of the image plane electric field
+        """
+
+        for i, (fwd, rev, absF1, mse_denom) in enumerate(
+            zip(
+                self.forward_prop, self.backward_prop, self.absFlist[1:], self.mse_denom
+            )
+        ):
+            G1 = _angular_spectrum_prop(self.G0, fwd)
+            phs_G1 = np.angle(G1)
+            G1prime = absF1 * np.exp(1j * phs_G1)
+            G0prime = _angular_spectrum_prop(G1prime, rev)
+            phs_G0prime = np.angle(G0prime)
+            # G0primeprime = self.absFlist[0] * np.exp(1j*phs_G0prime)
+            G0primeprime = self.absFlist[0] * np.exp(1j * phs_G0prime)
+
+            # remember to update the phase guess for PSF
+            self.G0 = G0primeprime
+            self.cost_functions[i].append(
+                mean_squared_error(np.abs(G0prime), self.absFlist[0], norm=mse_denom)
+            )
+            self.iter += 1
+
+        # return pupil_estimate
+        # pupil_estimate = np.fft.ifftshift(np.fft.ifft2(G0primeprime))
+
+        return np.fft.fftshift(G0primeprime)
+
+
+class GerchbergSaxton(IterativeTransformPhaseRetrieval):
+    """Gerchberg-Saxton phase retrieval algorithm
+
+    Notes
+    -----
+    This algorithm does not include focus diversity because the algorithm proposed
+    by Gerchberg and Saxton did not propose focus diversity [1], but PSF estimation from
+    a single plane. See the FocusDiverse variant for a focus-diverse implementation of
+    this algorithm 
+
+    References
+    ----------
+    [1] R. W. Gerchberg and W. O. Saxton, "A practical algorithm for the determination of 
+        phase from image and diffraction plane pictures," Optik 35, 237–246 (1972).
+    """
+    def __init__(
+            self,
+            amp: np.ndarray,
+            wvl: float,
+            executor: "prysm.fttools.executor",
+            data: np.ndarray,
+            initial_phase: np.ndarray | None = None,
+    ) -> None:
+        super().__init__(amp, wvl, executor, data, initial_phase)
+
+    def step(self):
+
+        # Advance GS iteration
+        G = focus_dft(self.g, self.executor)
+        phs_G = np.angle(G)
+        Gprime = self.absF * np.exp(1j * phs_G)
+        gprime = unfocus_dft(Gprime, self.executor)
+        phs_gprime = np.angle(gprime)
+        gprimeprime = self.absg * np.exp(1j * phs_gprime)
+        
+        # Collect MSE between prior state and data
+        mse = mean_squared_error(np.abs(G), self.absF)
+
+        # Save data
+        self.cost.append(mse)
+        self.iter += 1
+        self.g = gprimeprime
+        return gprimeprime
+    
+
+class ErrorReduction(IterativeTransformPhaseRetrieval):
+    """Error Reduction phase retrieval algorithm
+
+    Notes
+    -----
+    Error Reduction is similar to the Gerchberg-Saxton [1] algorithm that uses a different
+    update rule for the pupil plane. 
+
+    References
+    ----------
+    [1] R. W. Gerchberg and W. O. Saxton, "A practical algorithm for the determination of 
+        phase from image and diffraction plane pictures," Optik 35, 237–246 (1972).
+    """
+    def __init__(
+            self,
+            amp: np.ndarray,
+            wvl: float,
+            executor: "prysm.fttools.executor",
+            data: np.ndarray,
+            initial_phase: np.ndarray | None = None,
+    ) -> None:
+        super().__init__(amp, wvl, executor, data, initial_phase)
+
+        # Define ER mask, we enforce that g be positive within
+        # the nonzero mask area, and zero outside.
+
+        # TODO: Make this a parameter to the class, so that the user can specify a different threshold
+        self.mask = self.absg > 1e-6
+        self.invmask = ~self.mask
+
+    def step(self):
+
+        # Advance ER iteration
+        G = focus_dft(self.g, self.executor)
+        phs_G = np.angle(G)
+        Gprime = self.absF * np.exp(1j * phs_G)
+        gprime = unfocus_dft(Gprime, self.executor)
+
+        # Error Reduction's "minimum update" that |F| is positive
+        gprimeprime = gprime
+        gprimeprime[self.invmask] = 0
+        subset = gprimeprime[self.mask]
+        subset[subset < 0] = 0
+        
+        # Collect MSE between prior state and data
+        mse = mean_squared_error(np.abs(G), self.absF)
+
+        # Save data
+        self.cost.append(mse)
+        self.iter += 1
+        self.g = gprimeprime
+        return gprimeprime
+    
+
+class SteepestDescent(IterativeTransformPhaseRetrieval):
+    """Steepest Descent (SD) phase retrieval algorithm
+
+    Steepest Descent is similar to the Gerchberg-Saxton [1] algorithm, but constructs
+    the update in the direction of the gradient of an objective function. In 
+    Fienup 1982 [2], the objective function is the mean squared error between the 
+    current estimate of the PSF and the measured PSF.
+
+    B = np.sum((np.abs(F) - np.abs(G)) ** 2) # proportional to mean squared error
+    g'' - g  = - 0.25 * dB/dg = 0.5 * (g' - g)
+    g'' = - 0.5 * (g - g') 
+
+
+    Notes
+    -----
+    This algorithm does not include focus diversity because the algorithm proposed
+    by Gerchberg and Saxton did not propose focus diversity [1], but PSF estimation from
+    a single plane. See the FocusDiverse variant for a focus-diverse implementation of
+    this algorithm 
+
+    References
+    ----------
+    [1] R. W. Gerchberg and W. O. Saxton, "A practical algorithm for the determination of 
+        phase from image and diffraction plane pictures," Optik 35, 237–246 (1972).
+    [2] J. R. Fienup, "Phase retrieval algorithms: a comparison," Applied Optics 21, 
+        2758-2769 (1982).
+    """
+    def __init__(
+            self,
+            amp: np.ndarray,
+            wvl: float,
+            executor: "prysm.fttools.executor",
+            data: np.ndarray,
+            initial_phase: np.ndarray | None = None,
+            doublestep: bool = True,
+    ) -> None:
+        super().__init__(amp, wvl, executor, data, initial_phase)
+        self.doublestep = doublestep
+
+    def step(self):
+
+        # Advance SD iteration
+        G = focus_dft(self.g, self.executor)
+        phs_G = np.angle(G)
+        Gprime = self.absF * np.exp(1j * phs_G)
+        gprime = unfocus_dft(Gprime, self.executor)
+
+        # Steepest Descent is analogous to GS until the formation of
+        # gprimeprime
+        if self.doublestep:
+            gprimeprime = gprime
+        else:
+            gprimeprime = 0.5 * (gprimeprime - self.g) + self.g
+
+        # After, apply doublestep
+        phs_gprime = np.angle(gprimeprime)
+        gprimeprime = self.absg * np.exp(1j * phs_gprime)
+        
+        # Collect MSE between prior state and data
+        mse = mean_squared_error(np.abs(G), self.absF)
+
+        # Save data
+        self.cost.append(mse)
+        self.iter += 1
+        self.g = gprimeprime
+        return gprimeprime
+    
+
+class ConjugateGradient(IterativeTransformPhaseRetrieval):
+    """Conjugate Gradient (CG) phase retrieval algorithm
+
+    Implementation of the conjugate gradient algorithm from Fienup 1982 [2] (the alternative
+    derivation). For further discussion, see Brandon Dube's second phase retrieval blog post [3]
+
+    Notes
+    -----
+    This algorithm does not include focus diversity because the algorithm proposed
+    by Gerchberg and Saxton did not propose focus diversity [1], but PSF estimation from
+    a single plane. See the FocusDiverse variant for a focus-diverse implementation of
+    this algorithm.
+
+    References
+    ----------
+    [1] R. W. Gerchberg and W. O. Saxton, "A practical algorithm for the determination of 
+        phase from image and diffraction plane pictures," Optik 35, 237–246 (1972).
+    [2] J. R. Fienup, "Phase retrieval algorithms: a comparison," Applied Optics 21,
+    [3] https://www.retrorefractions.com/blog/phase-retrieval-02/
+    """
+    def __init__(
+            self,
+            amp: np.ndarray,
+            wvl: float,
+            executor: "prysm.fttools.executor",
+            data: np.ndarray,
+            initial_phase: np.ndarray | None = None,
+            hk: float = 1.0,
+    ) -> None:
+        super().__init__(amp, wvl, executor, data, initial_phase)
+        self.hk = hk
+        self.gprimekm1 = self.g
+
+    def step(self):
+
+        # Advance GS iteration
+        G = focus_dft(self.g, self.executor)
+        mse = mean_squared_error(np.abs(G), self.absF)
+        Bk = mse 
+        phs_G = np.angle(G)
+        Gprime = self.absF * np.exp(1j * phs_G)
+        gprime = unfocus_dft(Gprime, self.executor)
+
+        gprimeprime = gprime + self.hk * (gprime - self.gprimekm1)
+
+        # apply object domain constraints
+        phs_gprime = np.angle(gprimeprime)
+        gprimeprime = self.absg * np.exp(1j * phs_gprime)
+        
+
+        # Save data
+        self.cost.append(mse)
+        self.iter += 1
+        self.Bkm1 = Bk
+        self.gprimekm1 = gprime
+        self.g = gprimeprime
+        return gprimeprime
+    
+
 
 class ADPhaseRetireval:
     def __init__(
@@ -458,110 +847,3 @@ class ParallelADPhaseRetrieval:
 
         return self.f, self.g
 
-
-class FocusDiversePhaseRetrieval:
-    """Focus Diversity Phase Retrieval using iterative-transform iteration.
-    Largely taken from the praise repository and associated Phase retrieval demos
-    by Brandon Dube
-
-    Algorithm inspired by Misel's two-psf algorithm [1], generalized to N psfs
-    - [1] D L Misell 1973 J. Phys. D: Appl. Phys. 6 2200
-    """
-
-    def __init__(self, psflist, wvl, dxs, defocus_positions, phase_guess=None):
-        """Phase Retrieval Iterator using Focus Diversity for N defocus positions
-
-        Parameters
-        ----------
-        psflist : list of numpy.ndarrays of the same shape
-            length N list of numpy.ndarrays that contain the defocused PSF data. Must be of the same pixel scale
-            and array size
-        wvl : float
-            wavelength of light in microns
-        dxs : float
-            pixel scale of the arrays in psflist in microns
-        defocus_positions : list of floats
-            defocus positions in microns
-        phase_guess : numpy.ndarray, optional
-            phase guess of the desired pupil sampling, by default None
-        """
-
-        # catch some common mistakes
-        assert len(defocus_positions) == len(dxs), (
-            f"defocus_positions and dxs should have the same length, got {len(defocus_positions)} and {len(dxs)}"
-        )
-        assert (len(psflist) == len(dxs) + 1) and (
-            len(psflist) == len(defocus_positions) + 1
-        ), (
-            f"psflist should be one element longer than dxs and defocus_positions, got {len(psflist)}"
-        )
-
-        try:
-            if phase_guess is None:
-                phase_guess = np.random.rand(*psflist[0].shape)
-
-            self.absFlist = []
-            self.mse_denom = []
-
-            # TODO: Throw a try-except
-
-            # Create the object domain data in field units
-            for psf in psflist:
-                self.absFlist.append(np.fft.ifftshift(np.sqrt(psf)))
-                self.mse_denom.append(np.sum(psf))
-
-            # Begin with a guess using the first PSF
-            phase_guess = np.fft.ifftshift(phase_guess)
-            self.G0 = self.absFlist[0] * np.exp(1j * phase_guess)
-
-            # pre-compute transfer functions, lists of kernels
-            self.forward_prop = []
-            self.backward_prop = []
-            self.cost_functions = []  # will be a list of lists
-            for dz, dx in zip(defocus_positions, dxs):
-                self.forward_prop.append(
-                    _angular_spectrum_transfer_function(psflist[0].shape, wvl, dx, dz)
-                )  # there was a 1e-3 factor here
-                self.backward_prop.append(
-                    _angular_spectrum_transfer_function(psflist[0].shape, wvl, dx, -dz)
-                )
-                self.cost_functions.append([])
-
-            self.iter = 0
-
-        except Exception as e:
-            self.log.critical(f"Error in initializing iterator: \n {e}")
-
-    def step(self):
-        """use Misel's algorithm to perform an iteration between image space and the fourier plane
-
-        Returns
-        -------
-        G0primeprime
-            updated estimate of the image plane electric field
-        """
-
-        for i, (fwd, rev, absF1, mse_denom) in enumerate(
-            zip(
-                self.forward_prop, self.backward_prop, self.absFlist[1:], self.mse_denom
-            )
-        ):
-            G1 = _angular_spectrum_prop(self.G0, fwd)
-            phs_G1 = np.angle(G1)
-            G1prime = absF1 * np.exp(1j * phs_G1)
-            G0prime = _angular_spectrum_prop(G1prime, rev)
-            phs_G0prime = np.angle(G0prime)
-            # G0primeprime = self.absFlist[0] * np.exp(1j*phs_G0prime)
-            G0primeprime = self.absFlist[0] * np.exp(1j * phs_G0prime)
-
-            # remember to update the phase guess for PSF
-            self.G0 = G0primeprime
-            self.cost_functions[i].append(
-                mean_squared_error(np.abs(G0prime), self.absFlist[0], norm=mse_denom)
-            )
-            self.iter += 1
-
-        # return pupil_estimate
-        # pupil_estimate = np.fft.ifftshift(np.fft.ifft2(G0primeprime))
-
-        return np.fft.fftshift(G0primeprime)
