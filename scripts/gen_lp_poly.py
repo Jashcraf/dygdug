@@ -54,11 +54,11 @@ from dygdug.models import Coronagraph, PolychromaticExecutor
 
 # Define instrument parameters
 circumscribed_diameter = 10.95e3
-Npup = 1024
-Nfoc = 256
+Npup = 512 
+Nfoc = 192
 fno = 13.66
 efl = fno * circumscribed_diameter
-px_per_lamD = 8  # the "oversampling"
+px_per_lamD = 3  # the "oversampling"
 
 # Band parameters.  The focal grid is fixed in physical units across the band
 # (one detector, one fabricated mask), so lam/D -- and therefore the working
@@ -72,7 +72,7 @@ wvls = onp.linspace(wvl0 * (1 - bandwidth / 2), wvl0 * (1 + bandwidth / 2), n_wv
 lamD = wvl0 / circumscribed_diameter * efl  # band-center lam/D, physical units
 focal_dx = lamD / px_per_lamD
 
-iwa, owa = 3, 8  # lam/D at band center
+iwa, owa = 6, 10  # lam/D at band center
 contrast_req = 1e-10
 DH_STRIDE = 1  # keep every Nth dark-hole pixel as an LP constraint
 
@@ -136,7 +136,7 @@ print(f"A_ub {rows * n * 8 / 1e9:.1f} GB, normal equations {rows * rows * 8 / 1e
 # from now.  A_ub alone is rows x n; at the full design scale (Npup = 1024, a
 # 3-8 lam/D dark hole at px_per_lamD = 8) that is hundreds of GB before any
 # wavelength stacking, because n is ~800k pupil pixels.
-MEMORY_BUDGET_GB = 8.0
+MEMORY_BUDGET_GB = 16.0
 est_gb = (rows * n + rows * rows) * 8 / 1e9
 if est_gb > MEMORY_BUDGET_GB:
     raise SystemExit(
